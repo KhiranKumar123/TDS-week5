@@ -252,7 +252,6 @@ def get_agent_card(base_url: str) -> dict:
     }
 
 def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, base_url: str):
-    # Normalize path (resolve double slashes and strip trailing slashes)
     clean_path = path.split('?')[0]
     clean_path = re.sub(r'/+', '/', clean_path).rstrip('/')
     
@@ -260,11 +259,11 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
     if method == 'GET' and clean_path.endswith('.well-known/agent-card.json'):
         return 200, get_agent_card(base_url)
 
-    # 2. Content-Type Validation on POST requests (A2A_MEDIA_TYPE_REJECTION check)
+    # 2. Strict Content-Type Validation on POST requests (A2A_MEDIA_TYPE_REJECTION check)
     if method == 'POST':
-        c_type = get_header(headers, 'Content-Type') or ''
-        if not c_type or not any(mt in c_type.lower() for mt in ['application/a2a+json', 'application/json', 'json']):
-            return 415, {"error": {"code": "UNSUPPORTED_MEDIA_TYPE", "message": "Content-Type must be application/a2a+json or application/json"}}
+        c_type = (get_header(headers, 'Content-Type') or '').lower()
+        if 'application/a2a+json' not in c_type:
+            return 415, {"error": {"code": "UNSUPPORTED_MEDIA_TYPE", "message": "Content-Type must be application/a2a+json"}}
 
     # 3. Version Verification
     a2a_ver = get_header(headers, 'A2A-Version')
