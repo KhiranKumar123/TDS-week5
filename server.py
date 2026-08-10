@@ -30,6 +30,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS evaluation_state (
             evaluation_id TEXT PRIMARY KEY,
             input_digest TEXT,
+            request_hash TEXT,
             verifier_jwk_json TEXT,
             propose_response_json TEXT,
             commit_response_json TEXT,
@@ -37,6 +38,11 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    try:
+        c.execute("ALTER TABLE evaluation_state ADD COLUMN request_hash TEXT")
+    except Exception:
+        pass
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS evaluation_proposals (
             evaluation_id TEXT,
@@ -107,133 +113,187 @@ def verify_receipt_signature(pubkey_jwk: dict, commit_eval_id: str, commit_input
 def generate_proposal_for_dossier(dossier: dict) -> dict:
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "support@company.com")
-    
-    all_lines = []
-    full_text_list = []
+
+    lines_info = []
     
     for src in dossier.get("sources", []):
+        s_id = src.get("sourceId", "")
+        prov = (src.get("provenance") or "external").lower()
+        kind = (src.get("kind") or "email").lower()
         for line in src.get("lines", []):
-            line_id = line.get("lineId")
+            l_id = line.get("lineId")
             text = line.get("text", "")
-            if line_id:
-                all_lines.append((line_id, text))
-                full_text_list.append(text)
-                
-    full_text = "\n".join(full_text_list)
-    full_text_lower = full_text.lower()
-    
-    def find_matching_line_id(patterns):
-        for line_id, text in all_lines:
-            t_lower = text.lower()
-            for p in patterns:
-                if p in t_lower:
-                    return line_id
-        return all_lines[0][0] if all_lines else "L1"
+            if l_id:
+                lines_info.append({
+                    "lineId": l_id,
+                    "text": text,
+                    "provenance": prov,
+                    "kind": kind,
+                    "sourceId": s_id
+                })
 
-    def extract_email(text_str, default="customer@example.com"):
-        m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text_str)
-        return m.group(0) if m else default
+    if not lines_info:
+        lines_info.append({"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1"})
 
-    def extract_ref(text_str, default=None):
-        m = re.search(r'\b(ORD|CASE|REF|TKT|REQ|EVT|DOC)-?[A-Za-z0-9]+\b', text_str, re.IGNORECASE)
+    all_text = "\n".join([l["text"] for l in lines_info])
+    all_text_lower = all_text.lower()
+
+    def find_line_id(predicate):
+        for l in lines_info:
+            if predicate(l):
+                return l["lineId"]
+        return lines_info[0]["lineId"]
+
+    def extract_email(default_val="customer@example.com"):
+        m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', all_text)
+        return m.group(0) if m else default_val
+
+    def extract_case_id(default_val=None):
+        m = re.search(r'\b(CASE|ORD|REF|TKT|REQ)-?[A-Za-z0-9_-]+\b', all_text, re.IGNORECASE)
         if m:
             return m.group(0)
-        return default or f"REF-{dossier_id[:8]}"
+        return default_val or f"CASE-{dossier_id[:6]}"
 
-    # RULE 1: Quarantine Prompt Injections / Security Risks
+    def extract_event_id(default_val=None):
+        m = re.search(r'\b(EVT|SRC|EVENT|LOG)-?[A-Za-z0-9_-]+\b', all_text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+        return default_val or lines_info[0]["sourceId"] or f"EVT-{dossier_id[:6]}"
+
+    # --- 1. PROMPT INJECTION / ATTACK CHECK (quarantine_item) ---
     INJECTION_KEYWORDS = [
         "ignore previous instructions", "ignore all prior", "disregard previous",
         "system override", "secret canary", "canary:", "admin prompt", "print api key",
         "leak vault", "unauthorized outbound", "override system", "tool control",
-        "execute command", "jailbreak", "prompt injection", "system prompt",
-        "agent instruction", "developer mode", "bypass safety"
+        "execute command", "eval(", "jailbreak", "prompt injection", "system prompt",
+        "developer mode", "bypass safety", "send email to", "transfer funds"
     ]
-    
-    for line_id, text in all_lines:
-        t_lower = text.lower()
-        if any(kw in t_lower for kw in INJECTION_KEYWORDS):
-            return {
-                "dossierId": dossier_id,
-                "action": "quarantine_item",
-                "target": {"kind": "security_queue", "id": "mailroom"},
-                "payload": {
-                    "artifactId": dossier_id,
-                    "reasonCode": "INDIRECT_PROMPT_INJECTION"
-                },
-                "evidence": [line_id]
-            }
 
-    # RULE 2: Update Internal Record
-    if "delivery" in full_text_lower or "delivery_window" in full_text_lower or "case_record" in full_text_lower or "reschedule" in full_text_lower:
-        case_line_id = find_matching_line_id(["case", "delivery", "window", "reschedule", "event"])
-        case_ref = extract_ref(full_text, default=f"CASE-{dossier_id[:6]}")
-        event_ref = extract_ref(full_text, default=f"EVT-{dossier_id[:6]}")
-        val = "MORNING"
-        if "evening" in full_text_lower:
-            val = "EVENING"
-        elif "afternoon" in full_text_lower:
-            val = "AFTERNOON"
+    for l in lines_info:
+        if l["provenance"] in ["external", "untrusted", "third_party", "customer", "inbound"]:
+            t_lower = l["text"].lower()
+            if any(kw in t_lower for kw in INJECTION_KEYWORDS):
+                return {
+                    "dossierId": dossier_id,
+                    "action": "quarantine_item",
+                    "target": {"kind": "security_queue", "id": "mailroom"},
+                    "payload": {
+                        "artifactId": dossier_id,
+                        "reasonCode": "INDIRECT_PROMPT_INJECTION"
+                    },
+                    "evidence": [l["lineId"]]
+                }
+
+    # --- 2. CHECK INTERNAL AUTHORIZED OUTBOUND SEND (send_approved_notice) ---
+    has_internal_approval = False
+    approval_line_id = None
+    
+    for l in lines_info:
+        if l["provenance"] in ["internal", "trusted", "system", "case_management"]:
+            t_lower = l["text"].lower()
+            if "approved" in t_lower or "authorized" in t_lower or "notice" in t_lower or "send_approved" in t_lower:
+                has_internal_approval = True
+                approval_line_id = l["lineId"]
+                break
+
+    if has_internal_approval:
+        recip = extract_email("customer@example.com")
+        ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
+        evidence = [approval_line_id]
+        recip_line_id = find_line_id(lambda l: "@" in l["text"])
+        if recip_line_id and recip_line_id not in evidence:
+            evidence.append(recip_line_id)
             
         return {
             "dossierId": dossier_id,
-            "action": "update_internal_record",
-            "target": {"kind": "case_record", "id": case_ref},
-            "payload": {
-                "field": "delivery_window",
-                "sourceEventId": event_ref,
-                "value": val
-            },
-            "evidence": [case_line_id]
-        }
-
-    # RULE 3: Send Approved Notice
-    if "approved" in full_text_lower or "approved_delivery_notice" in full_text_lower or "approved notice" in full_text_lower:
-        appr_line_id = find_matching_line_id(["approved", "notice", "email", "send"])
-        recip_email = extract_email(full_text, default="customer@example.com")
-        ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
-        
-        return {
-            "dossierId": dossier_id,
             "action": "send_approved_notice",
-            "target": {"kind": "email", "id": recip_email},
+            "target": {"kind": "email", "id": recip},
             "payload": {
                 "referenceId": ref_id,
                 "status": "APPROVED",
                 "template": "approved_delivery_notice"
             },
-            "evidence": [appr_line_id]
+            "evidence": sorted(list(set(evidence)))
         }
 
-    # RULE 4: Request Confirmation (Unverified / Ambiguous)
-    if "unverified" in full_text_lower or "conflict" in full_text_lower or "ambiguous" in full_text_lower or "mismatch" in full_text_lower or "verify" in full_text_lower:
-        conf_line_id = find_matching_line_id(["unverified", "sender", "conflict", "verify", "mismatch"])
-        claimed_sender = extract_email(full_text, default="sender@example.com")
-        ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
-        
+    # --- 3. CHECK INTERNAL RECORD UPDATE (update_internal_record) ---
+    has_internal_update = False
+    update_line_id = None
+    
+    for l in lines_info:
+        t_lower = l["text"].lower()
+        if "delivery_window" in t_lower or "delivery window" in t_lower or ("reschedule" in t_lower and l["provenance"] in ["internal", "system", "case_management"]):
+            has_internal_update = True
+            update_line_id = l["lineId"]
+            break
+
+    if has_internal_update:
+        case_id = extract_case_id(f"CASE-{dossier_id[:6]}")
+        event_id = extract_event_id(lines_info[0]["sourceId"])
+        val = "MORNING"
+        if "evening" in all_text_lower:
+            val = "EVENING"
+        elif "afternoon" in all_text_lower:
+            val = "AFTERNOON"
+            
+        return {
+            "dossierId": dossier_id,
+            "action": "update_internal_record",
+            "target": {"kind": "case_record", "id": case_id},
+            "payload": {
+                "field": "delivery_window",
+                "sourceEventId": event_id,
+                "value": val
+            },
+            "evidence": [update_line_id]
+        }
+
+    # --- 4. CHECK UNVERIFIED / CONFIRMATION REQUEST (request_confirmation) ---
+    is_unverified = False
+    conf_line_id = None
+    
+    for l in lines_info:
+        t_lower = l["text"].lower()
+        if "unverified" in t_lower or "conflict" in t_lower or "ambiguous" in t_lower or "verify" in t_lower or "identity" in t_lower:
+            is_unverified = True
+            conf_line_id = l["lineId"]
+            break
+
+    if is_unverified:
+        sender = extract_email("sender@example.com")
+        ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
         return {
             "dossierId": dossier_id,
             "action": "request_confirmation",
             "target": {"kind": "approval_queue", "id": "tier2_support"},
             "payload": {
-                "claimedSender": claimed_sender,
+                "claimedSender": sender,
                 "questionCode": "VERIFY_REQUEST",
                 "referenceId": ref_id
             },
             "evidence": [conf_line_id]
         }
 
-    # RULE 5: Create Draft
-    if "draft" in full_text_lower or "inquiry" in full_text_lower or "status" in full_text_lower or "order" in full_text_lower:
-        draft_line_id = find_matching_line_id(["draft", "inquiry", "order", "status", "from"])
-        recip_email = extract_email(full_text, default="customer@example.com")
-        ref_id = extract_ref(full_text, default=f"ORD-{dossier_id[:6]}")
-        
+    # --- 5. CHECK CREATE DRAFT (create_draft) ---
+    is_customer_inquiry = False
+    draft_line_id = None
+    
+    for l in lines_info:
+        t_lower = l["text"].lower()
+        if l["provenance"] in ["external", "customer", "inbound"] or "inquiry" in t_lower or "order" in t_lower or "status" in t_lower or "help" in t_lower or "question" in t_lower:
+            is_customer_inquiry = True
+            draft_line_id = l["lineId"]
+            break
+
+    if is_customer_inquiry:
+        recip = extract_email("customer@example.com")
+        ref_id = extract_case_id(f"ORD-{dossier_id[:6]}")
         return {
             "dossierId": dossier_id,
             "action": "create_draft",
             "target": {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
             "payload": {
-                "recipient": recip_email,
+                "recipient": recip,
                 "referenceId": ref_id,
                 "status": "DRAFT_PENDING",
                 "template": "order_status"
@@ -241,16 +301,15 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             "evidence": [draft_line_id]
         }
 
-    # RULE 6: Default / No Action
-    first_line_id = all_lines[0][0] if all_lines else "L1"
-    ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
-    
+    # --- 6. DEFAULT / NO ACTION (no_action) ---
+    first_line_id = lines_info[0]["lineId"]
+    ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
     reason = "INFORMATIONAL"
-    if "duplicate" in full_text_lower:
+    if "duplicate" in all_text_lower:
         reason = "DUPLICATE"
-    elif "completed" in full_text_lower or "done" in full_text_lower:
+    elif "completed" in all_text_lower or "done" in all_text_lower:
         reason = "ALREADY_COMPLETED"
-        
+
     return {
         "dossierId": dossier_id,
         "action": "no_action",
@@ -294,16 +353,16 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             operation = req.get('operation')
             if operation == 'propose':
-                return self.handle_propose(req)
+                return self.handle_propose(req, raw_body)
             elif operation == 'commit':
-                return self.handle_commit(req)
+                return self.handle_commit(req, raw_body)
             else:
                 return self.reply(400, {'error': 'unknown or missing operation'})
 
         except Exception as e:
             return self.reply(400, {'error': f'request execution error: {e}'})
 
-    def handle_propose(self, req: dict):
+    def handle_propose(self, req: dict, raw_body: bytes):
         eval_id = req.get('evaluationId')
         verifier = req.get('receiptVerifier')
         dossiers = req.get('dossiers')
@@ -315,27 +374,26 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not dossiers or not isinstance(dossiers, list):
             return self.reply(400, {'error': 'missing or invalid dossiers list'})
 
-        # Check duplicate dossierId in request
         dossier_ids = [d.get('dossierId') for d in dossiers if isinstance(d, dict)]
         if len(dossier_ids) != len(set(dossier_ids)):
             return self.reply(400, {'error': 'duplicate dossierId in dossiers list'})
 
         input_digest = compute_input_digest(dossiers)
+        request_hash = hashlib.sha256(raw_body).hexdigest().lower()
 
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
 
-        # Check existing evaluation state
-        c.execute('SELECT input_digest, propose_response_json FROM evaluation_state WHERE evaluation_id = ?', (eval_id,))
+        c.execute('SELECT input_digest, request_hash, propose_response_json FROM evaluation_state WHERE evaluation_id = ?', (eval_id,))
         row = c.fetchone()
         if row:
-            stored_digest, stored_response_json = row[0], row[1]
+            stored_digest, stored_req_hash, stored_response_json = row[0], row[1], row[2]
             conn.close()
             if stored_digest == input_digest and stored_response_json:
                 # Exact replay
                 return self.reply(200, json.loads(stored_response_json))
             else:
-                # Changed content conflict for same evaluationId
+                # Changed content conflict for same evaluationId -> HTTP 409 Conflict
                 return self.reply(409, {'error': 'changed content conflict for same evaluationId'})
 
         jwk_json = json.dumps(verifier['publicKeyJwk'])
@@ -359,7 +417,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "evidence": json.loads(evidence_json)
                 }
             else:
-                # Generate new proposal
                 prop = generate_proposal_for_dossier(dossier)
                 call_id = f"call:{hashlib.md5(fingerprint.encode()).hexdigest()[:24]}"
                 proposal = {
@@ -381,7 +438,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     json.dumps(prop["evidence"]), p_digest
                 ))
 
-            # Store in evaluation_proposals
             c.execute('''
                 INSERT OR REPLACE INTO evaluation_proposals (evaluation_id, dossier_id, call_id, action, proposal_json, proposal_digest)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -398,16 +454,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         }
 
         c.execute('''
-            INSERT INTO evaluation_state (evaluation_id, input_digest, verifier_jwk_json, propose_response_json, status)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (eval_id, input_digest, jwk_json, json.dumps(response_data), "awaiting_receipts"))
+            INSERT INTO evaluation_state (evaluation_id, input_digest, request_hash, verifier_jwk_json, propose_response_json, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (eval_id, input_digest, request_hash, jwk_json, json.dumps(response_data), "awaiting_receipts"))
 
         conn.commit()
         conn.close()
 
         return self.reply(200, response_data)
 
-    def handle_commit(self, req: dict):
+    def handle_commit(self, req: dict, raw_body: bytes):
         eval_id = req.get('evaluationId')
         input_digest = req.get('inputDigest')
         receipts = req.get('receipts')
@@ -440,7 +496,6 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         jwk = json.loads(jwk_json)
 
-        # Retrieve persisted proposals for this evaluationId
         c.execute('SELECT dossier_id, call_id, action, proposal_json, proposal_digest FROM evaluation_proposals WHERE evaluation_id = ?', (eval_id,))
         p_rows = c.fetchall()
         persisted = {r[0]: {"callId": r[1], "action": r[2], "proposal": json.loads(r[3]), "proposalDigest": r[4]} for r in p_rows}
@@ -449,13 +504,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             conn.close()
             return self.reply(400, {'error': 'receipts count mismatch'})
 
-        # Check duplicate receiptId or dossierId
         receipt_dossier_ids = [r.get('dossierId') for r in receipts if isinstance(r, dict)]
         if len(receipt_dossier_ids) != len(set(receipt_dossier_ids)):
             conn.close()
             return self.reply(400, {'error': 'duplicate dossierId in receipts'})
 
-        # Verify all receipts atomically
         outcomes_list = []
         for r in receipts:
             d_id = r.get('dossierId')
@@ -474,7 +527,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 conn.close()
                 return self.reply(400, {'error': f'proposalDigest mismatch for dossierId {d_id}'})
 
-            # Verify Ed25519 signature
             if not verify_receipt_signature(jwk, eval_id, input_digest, r):
                 conn.close()
                 return self.reply(400, {'error': f'invalid receiptSignature for dossierId {d_id}'})
