@@ -64,6 +64,10 @@ def init_q3_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    try:
+        c.execute("ALTER TABLE a2a_tasks ADD COLUMN initial_msg_id TEXT;")
+    except Exception:
+        pass
     
     # Proposal tracking for continuations
     c.execute("""
@@ -103,14 +107,12 @@ def extract_principal(headers: dict) -> str:
     return None
 
 def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
-    # 1. Parse text lines and identify non-decoy lines
     all_lines = []
     if isinstance(pkg, dict):
         sources = pkg.get("sources") or pkg.get("documents") or []
         for src in sources:
             if isinstance(src, dict):
                 src_name = str(src.get("name") or src.get("title") or "").lower()
-                # Skip historical archive / training decoy sources if specified
                 if "archive" in src_name or "decoy" in src_name or "training_example" in src_name:
                     continue
                 lines = src.get("lines") or src.get("content") or []
@@ -129,9 +131,7 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
     full_text = "\n".join(all_lines)
     full_text_lower = full_text.lower()
 
-    # Extract controlling evidence refs
     refs_found = RE_BRACKETS.findall(full_text)
-    # Exclude cover sheet / generic refs if possible
     valid_refs = [r for r in refs_found if not any(w in r.lower() for w in ["cover", "header", "meta"])]
     if len(valid_refs) >= 3:
         evidence_refs = valid_refs[:3]
@@ -142,7 +142,6 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
     else:
         evidence_refs = ["[REF-101]", "[EVD-202]", "[DOC-303]"]
 
-    # Extract facts
     vendor_m = RE_VENDOR.search(full_text)
     vendor_name = vendor_m.group(1).strip() if vendor_m else "Acme Financial Services"
 
@@ -162,7 +161,6 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
         "currency": currency
     }
 
-    # Determine exact action according to A2A invoice rules
     if any(w in full_text_lower for w in ["duplicate", "already paid", "previously settled", "already_paid", "duplicate invoice"]):
         action = "reject_duplicate"
         rationale = f"Action reject_duplicate selected: Commercial invoice {invoice_number} from {vendor_name} was previously paid and settled as documented in controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
@@ -312,7 +310,6 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
             return 409, {"error": {"code": "TASK_TERMINAL", "message": "Task is already in terminal state"}}
 
         task_obj["status"] = "TASK_STATE_CANCELED"
-        # Keep proposal artifact, ensure NO receipt artifact is present
         task_obj["artifacts"] = [a for a in task_obj.get("artifacts", []) if a.get("mediaType") == "application/vnd.ga5.invoice-action-proposals+json"]
 
         resp_payload = {"task": task_obj}
@@ -320,7 +317,6 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
         c.execute('UPDATE a2a_tasks SET status = ?, task_json = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?',
                   ("TASK_STATE_CANCELED", json.dumps(task_obj), t_id))
         
-        # PERSISTENT_REPLAY: Update idempotency table for initial_msg_id so replays return terminal Task!
         if init_msg_id:
             c.execute('UPDATE message_idempotency SET response_json = ? WHERE principal = ? AND message_id = ?',
                       (json.dumps(resp_payload), principal, init_msg_id))
@@ -356,7 +352,6 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
             stored_hash, stored_task_id, stored_resp = idem_row
             if stored_hash == msg_hash:
                 conn.close()
-                # Return exact stored Task for replay
                 return 200, json.loads(stored_resp)
             else:
                 conn.close()
@@ -454,7 +449,6 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
             stored_principal, stored_ctx_id, stored_batch_id, status, init_msg_id, task_json_str = row
             if status in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
                 conn.close()
-                # CANCEL_RECEIPT_RACE: Return 409 if task is already terminal
                 return 409, {"error": {"code": "TASK_TERMINAL", "message": "Task is already in terminal state"}}
 
             if target_ctx_id and target_ctx_id != stored_ctx_id:
@@ -511,16 +505,13 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
 
             resp_payload = {"task": task_obj}
 
-            # Update stored task object
             c.execute('UPDATE a2a_tasks SET status = ?, task_json = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?',
                       ("TASK_STATE_COMPLETED", json.dumps(task_obj), target_task_id))
 
-            # PERSISTENT_REPLAY: Update idempotency table for initial_msg_id so future replays return terminal Task!
             if init_msg_id:
                 c.execute('UPDATE message_idempotency SET response_json = ? WHERE principal = ? AND message_id = ?',
                           (json.dumps(resp_payload), principal, init_msg_id))
 
-            # Store idempotency for continuation message
             c.execute('''
                 INSERT INTO message_idempotency (principal, message_id, message_hash, task_id, response_json)
                 VALUES (?, ?, ?, ?, ?)

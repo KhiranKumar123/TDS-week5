@@ -553,13 +553,15 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            if content_length <= 0 or content_length > 524288:
+            is_a2a_route = self.path.startswith('/a2a') or 'message:send' in self.path or '/tasks/' in self.path
+            
+            if not is_a2a_route and (content_length <= 0 or content_length > 524288):
                 return self.reply(400, {'action': 'block', 'reason': 'invalid content length', 'result': None})
 
-            raw_body = self.rfile.read(content_length)
+            raw_body = self.rfile.read(content_length) if content_length > 0 else b''
 
             # ROUTER STEP A: Question 3 A2A Protocol POST Routes (/a2a/message:send, /a2a/tasks/{id}:cancel)
-            if self.path.startswith('/a2a') or 'message:send' in self.path or '/tasks/' in self.path:
+            if is_a2a_route:
                 base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
                 headers_dict = {k: v for k, v in self.headers.items()}
                 code, resp_data = q3_invoice_agent.handle_a2a_route(self.path, 'POST', headers_dict, raw_body, base_url)
