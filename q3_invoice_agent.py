@@ -8,10 +8,17 @@ import time
 DEFAULT_Q3_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "invoice_agent_a2a.db")
 Q3_DB_PATH = os.environ.get("Q3_DB_PATH", DEFAULT_Q3_DB)
 
+# Pre-compile Regexes outside loops for instant processing
+RE_BRACKETS = re.compile(r'\[[A-Za-z0-9_\.:-]+\]')
+RE_VENDOR = re.compile(r'(?:vendorName|vendor|supplier|from)[-:\s"\']*([A-Za-z0-9\s,\.-]{2,40})', re.IGNORECASE)
+RE_INV_NUM = re.compile(r'(?:invoiceNumber|invoiceNo|invNum|invoice)[-:\s"\']*([A-Za-z0-9_-]{3,24})', re.IGNORECASE)
+RE_AMT = re.compile(r'(?:amountMinor|amount|total|sum)[-:\s"\']*(\d+)', re.IGNORECASE)
+RE_CURR = re.compile(r'(?:currency|curr)[-:\s"\']*([A-Z]{3})')
+
 def get_db_conn():
-    conn = sqlite3.connect(Q3_DB_PATH, timeout=60.0)
+    conn = sqlite3.connect(Q3_DB_PATH, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=60000;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 def init_q3_db():
@@ -94,27 +101,15 @@ def extract_principal(headers: dict) -> str:
             return token
     return None
 
-def analyze_invoice_package(pkg: dict) -> dict:
+def analyze_invoice_package_fast(pkg: dict, cache_map: dict, conn) -> dict:
     pkg_fingerprint = compute_hash(pkg)
-    
-    conn = get_db_conn()
-    c = conn.cursor()
-    c.execute('SELECT action, facts_json, evidence_json, rationale FROM package_decision_cache WHERE package_fingerprint = ?', (pkg_fingerprint,))
-    row = c.fetchone()
-    if row:
-        conn.close()
-        return {
-            "action": row[0],
-            "facts": json.loads(row[1]),
-            "evidenceRefs": json.loads(row[2]),
-            "rationale": row[3]
-        }
+    if pkg_fingerprint in cache_map:
+        return cache_map[pkg_fingerprint]
 
     text_content = json.dumps(pkg, ensure_ascii=False) if isinstance(pkg, dict) else str(pkg)
     text_lower = text_content.lower()
     
-    # Extract bracketed evidence references [Ref...] or [E...] or [EV...]
-    refs_found = re.findall(r'\[[A-Za-z0-9_\.:-]+\]', text_content)
+    refs_found = RE_BRACKETS.findall(text_content)
     if len(refs_found) >= 3:
         evidence_refs = refs_found[:3]
     elif len(refs_found) > 0:
@@ -122,19 +117,18 @@ def analyze_invoice_package(pkg: dict) -> dict:
     else:
         evidence_refs = ["[E1]", "[E2]", "[E3]"]
 
-    # Extract facts
-    vendor_m = re.search(r'(?:vendorName|vendor|supplier|from)[-:\s"\']*([A-Za-z0-9\s,\.-]{2,40})', text_content, re.IGNORECASE)
+    vendor_m = RE_VENDOR.search(text_content)
     vendor_name = vendor_m.group(1).strip() if vendor_m else "Acme Corp"
-    
-    inv_m = re.search(r'(?:invoiceNumber|invoiceNo|invNum|invoice)[-:\s"\']*([A-Za-z0-9_-]{3,24})', text_content, re.IGNORECASE)
-    invoice_number = inv_m.group(1).strip() if inv_m else f"INV-{pkg.get('packageId', '1001')[:6]}"
-    
-    amt_m = re.search(r'(?:amountMinor|amount|total|sum)[-:\s"\']*(\d+)', text_content, re.IGNORECASE)
+
+    inv_m = RE_INV_NUM.search(text_content)
+    invoice_number = inv_m.group(1).strip() if inv_m else f"INV-{str(pkg.get('packageId', '1001'))[:6]}"
+
+    amt_m = RE_AMT.search(text_content)
     amount_minor = int(amt_m.group(1)) if amt_m else 12500
-    
-    curr_m = re.search(r'(?:currency|curr)[-:\s"\']*([A-Z]{3})', text_content)
+
+    curr_m = RE_CURR.search(text_content)
     currency = curr_m.group(1) if curr_m else "INR"
-    
+
     facts = {
         "vendorName": vendor_name,
         "invoiceNumber": invoice_number,
@@ -168,14 +162,13 @@ def analyze_invoice_package(pkg: dict) -> dict:
         "rationale": rationale_desc
     }
 
-    c.execute('''
+    cache_map[pkg_fingerprint] = result
+    
+    conn.execute('''
         INSERT OR REPLACE INTO package_decision_cache (package_fingerprint, action, facts_json, evidence_json, rationale)
         VALUES (?, ?, ?, ?, ?)
     ''', (pkg_fingerprint, action, json.dumps(facts), json.dumps(evidence_refs), rationale_desc))
-    
-    conn.commit()
-    conn.close()
-    
+
     return result
 
 def get_agent_card(base_url: str) -> dict:
@@ -231,6 +224,17 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
 
     conn = get_db_conn()
     c = conn.cursor()
+
+    # Pre-load decision cache into memory map for 0-latency bulk processing
+    cache_map = {}
+    c.execute('SELECT package_fingerprint, action, facts_json, evidence_json, rationale FROM package_decision_cache')
+    for row in c.fetchall():
+        cache_map[row[0]] = {
+            "action": row[1],
+            "facts": json.loads(row[2]),
+            "evidenceRefs": json.loads(row[3]),
+            "rationale": row[4]
+        }
 
     # ROUTE: GET {base}tasks (List tasks for principal)
     if method == 'GET' and (clean_path == '/a2a/tasks' or clean_path == '/a2a/tasks/' or clean_path.endswith('/tasks')):
@@ -329,7 +333,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
                 pkg_id = pkg.get('packageId', f"pkg_{len(proposals_list)+1}")
                 act_id = f"act_{hashlib.md5((task_id + pkg_id).encode()).hexdigest()[:16]}"
                 
-                dec = analyze_invoice_package(pkg)
+                dec = analyze_invoice_package_fast(pkg, cache_map, conn)
                 
                 prop = {
                     "packageId": pkg_id,
