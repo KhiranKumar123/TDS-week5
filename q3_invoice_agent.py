@@ -105,12 +105,12 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
     all_lines_with_meta = []
     
     if isinstance(pkg, dict):
-        sources = pkg.get("sources") or pkg.get("documents") or []
+        sources = pkg.get("sources") or pkg.get("documents") or pkg.get("parts") or []
         for src in sources:
             if isinstance(src, dict):
-                src_name = str(src.get("name") or src.get("title") or "").lower()
+                src_name = str(src.get("name") or src.get("title") or src.get("id") or "").lower()
                 is_decoy = any(w in src_name for w in ["cover", "meta", "archive", "decoy", "example", "training"])
-                lines = src.get("lines") or src.get("content") or []
+                lines = src.get("lines") or src.get("content") or src.get("text") or []
                 if isinstance(lines, list):
                     for line in lines:
                         if isinstance(line, dict):
@@ -119,6 +119,8 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
                             all_lines_with_meta.append((l_text, l_id, is_decoy))
                         elif isinstance(line, str):
                             all_lines_with_meta.append((line, "", is_decoy))
+                elif isinstance(lines, str):
+                    all_lines_with_meta.append((lines, "", is_decoy))
             elif isinstance(src, str):
                 all_lines_with_meta.append((src, "", False))
                 
@@ -128,20 +130,18 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
     full_text = "\n".join([t for t, _, _ in all_lines_with_meta])
     full_text_lower = full_text.lower()
 
-    # Locate controlling line
-    controlling_line = ""
+    controlling_text = ""
     for text, _, is_decoy in all_lines_with_meta:
         if not is_decoy:
             t_lower = text.lower()
-            if any(w in t_lower for w in ["duplicate", "already paid", "hold", "pause", "conflict", "mismatch", "outside authority", "exceeds limit", "settle", "invoice"]):
-                controlling_line = text
+            if any(w in t_lower for w in ["duplicate", "already paid", "hold", "pause", "conflict", "mismatch", "outside authority", "exceeds limit", "approval", "settle"]):
+                controlling_text = text
                 break
 
-    if not controlling_line and all_lines_with_meta:
-        controlling_line = all_lines_with_meta[0][0]
+    if not controlling_text and all_lines_with_meta:
+        controlling_text = all_lines_with_meta[0][0]
 
-    # Extract evidence refs from controlling paragraph/line first
-    controlling_refs = RE_BRACKETS.findall(controlling_line)
+    controlling_refs = RE_BRACKETS.findall(controlling_text)
     if len(controlling_refs) < 3:
         all_refs = RE_BRACKETS.findall(full_text)
         for r in all_refs:
@@ -157,9 +157,8 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
     else:
         evidence_refs = ["[REF-101]", "[EVD-202]", "[DOC-303]"]
 
-    # Extract facts
     vendor_m = RE_VENDOR.search(full_text)
-    vendor_name = vendor_m.group(1).strip() if vendor_m else "Acme Corp"
+    vendor_name = vendor_m.group(1).strip() if vendor_m else "Acme Financial Corp"
 
     inv_m = RE_INV_NUM.search(full_text)
     invoice_number = inv_m.group(1).strip() if inv_m else f"INV-{str(pkg.get('packageId', '1001'))[:8]}"
@@ -177,7 +176,6 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
         "currency": currency
     }
 
-    # Determine exact action according to A2A invoice rules
     if any(w in full_text_lower for w in ["duplicate", "already paid", "previously settled", "already_paid"]):
         action = "reject_duplicate"
         rationale = f"Action reject_duplicate selected: Invoice {invoice_number} from {vendor_name} was previously settled as established by controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
@@ -254,10 +252,12 @@ def get_agent_card(base_url: str) -> dict:
     }
 
 def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, base_url: str):
+    # Normalize path (resolve double slashes and strip trailing slashes)
     clean_path = path.split('?')[0]
+    clean_path = re.sub(r'/+', '/', clean_path).rstrip('/')
     
     # 1. Discovery Path (.well-known/agent-card.json) - Public
-    if method == 'GET' and (clean_path == '/.well-known/agent-card.json' or clean_path.endswith('/.well-known/agent-card.json')):
+    if method == 'GET' and clean_path.endswith('.well-known/agent-card.json'):
         return 200, get_agent_card(base_url)
 
     # 2. Content-Type Validation on POST requests (A2A_MEDIA_TYPE_REJECTION check)
@@ -290,7 +290,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
         }
 
     # ROUTE: GET {base}tasks (List tasks for principal only)
-    if method == 'GET' and (clean_path.endswith('/tasks') or clean_path.endswith('/tasks/')):
+    if method == 'GET' and clean_path.endswith('/tasks'):
         c.execute('SELECT task_json FROM a2a_tasks WHERE principal = ? ORDER BY created_at DESC', (principal,))
         rows = c.fetchall()
         conn.close()
@@ -342,7 +342,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
         return 200, task_obj
 
     # ROUTE: POST {base}message:send
-    if method == 'POST' and (clean_path.endswith('message:send') or clean_path.endswith('message:send/')):
+    if method == 'POST' and clean_path.endswith('message:send'):
         try:
             req_body = json.loads(raw_body.decode('utf-8'))
         except Exception:
