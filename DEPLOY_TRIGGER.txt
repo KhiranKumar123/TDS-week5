@@ -1,1 +1,1 @@
-Deploying hardened guardrail update with master netloc allowlist and unsafe pattern blocking: 2026-08-10
+Deploying clean netloc allowlist guardrail: 2026-08-10

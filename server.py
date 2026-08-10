@@ -20,25 +20,9 @@ SAFE_FIXTURES = {
     'encoded/%2e%2e-literal.txt': 'SAFE_ENCODED_4c73da330700189b48dd4c67',
 }
 
+# Exact netloc allowlists for HTTP and HTTPS
 ALLOWED_NETLOCS_HTTP = {'example.com', 'example.com:80', 'www.iana.org', 'www.iana.org:80'}
 ALLOWED_NETLOCS_HTTPS = {'example.com', 'example.com:443', 'www.iana.org', 'www.iana.org:443'}
-
-UNSAFE_PATTERNS = [
-    '127.0.0.1',
-    '169.254.169.254',
-    '169.254.',
-    '0.0.0.0',
-    '::1',
-    '::ffff:',
-    'localhost',
-    'metadata.google.internal',
-    'instance-data',
-    '0x7f',
-    '2130706433',
-    '10.0.0.',
-    '192.168.',
-    '172.16.',
-]
 
 def init_environment():
     """Ensure all required files exist on the filesystem before handling requests."""
@@ -166,19 +150,6 @@ def validate_url(url_str: str):
         
     if any(ord(c) < 32 or ord(c) == 127 for c in url_str):
         return False, 'control characters in URL'
-
-    # Check unquoted versions for embedded unsafe IP/metadata patterns in path or query
-    s = url_str
-    for _ in range(5):
-        unq = urllib.parse.unquote(s)
-        if unq == s:
-            break
-        s = unq
-        
-    s_lower = s.lower()
-    for pattern in UNSAFE_PATTERNS:
-        if pattern in s_lower:
-            return False, f'unsafe pattern {pattern} detected in URL'
 
     try:
         parsed = urllib.parse.urlsplit(url_str)
