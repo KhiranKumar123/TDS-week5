@@ -261,6 +261,8 @@ DB_PATH = os.environ.get("DB_PATH", DEFAULT_DB)
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Drop stale cache to ensure fresh proposals are re-computed on deployment
+    c.execute("DROP TABLE IF EXISTS dossier_cache")
     c.execute("""
         CREATE TABLE IF NOT EXISTS dossier_cache (
             fingerprint TEXT PRIMARY KEY,
@@ -363,15 +365,31 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     mailbox = dossier.get("mailbox", "support@company.com")
 
     all_lines = []
+    lines_info = []
+    
     for src in dossier.get("sources", []):
+        s_id = src.get("sourceId", "")
+        prov = (src.get("provenance") or "external").lower()
+        kind = (src.get("kind") or "email").lower()
+        is_internal = prov in ["internal", "system", "trusted", "case_management", "vault", "security"]
+        
         for line in src.get("lines", []):
             line_id = line.get("lineId")
             text = line.get("text", "")
             if line_id:
                 all_lines.append((line_id, text))
+                lines_info.append({
+                    "lineId": line_id,
+                    "text": text,
+                    "provenance": prov,
+                    "kind": kind,
+                    "sourceId": s_id,
+                    "is_internal": is_internal
+                })
 
     if not all_lines:
         all_lines = [("L1", "")]
+        lines_info = [{"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1", "is_internal": False}]
 
     full_text = "\n".join([t for _, t in all_lines])
     full_text_lower = full_text.lower()
@@ -384,15 +402,33 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                     return line_id
         return all_lines[0][0]
 
-    def extract_email(text_str, default="customer@example.com"):
-        m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text_str)
-        return m.group(0) if m else default
+    def extract_exact_email(default_val="customer@example.com"):
+        m1 = re.search(r'(?:From|To|Sender|Client|User|Email)[-:\s]*([\w\.-]+@[\w\.-]+\.\w+)', full_text, re.IGNORECASE)
+        if m1:
+            return m1.group(1)
+        m2 = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', full_text)
+        if m2:
+            return m2.group(0)
+        return default_val
 
-    def extract_ref(text_str, default=None):
-        m = re.search(r'\b[A-Z]{2,4}-\d{3,8}\b', text_str)
-        if m:
-            return m.group(0)
-        return default or f"REF-{dossier_id[:6]}"
+    def extract_exact_ref(default_val=None):
+        m1 = re.search(r'\b(?:Reference|Ref|Order|Case|Ticket|Req|ID|Number|#)[-:\s#]*([A-Za-z0-9_-]{3,24})\b', full_text, re.IGNORECASE)
+        if m1:
+            return m1.group(1)
+        m2 = re.search(r'\b(ORD|CASE|REF|TKT|REQ|EVT|DOC)[-:#\s]*([A-Za-z0-9_-]+)\b', full_text, re.IGNORECASE)
+        if m2:
+            return f"{m2.group(1).upper()}-{m2.group(2)}"
+        m3 = re.search(r'\b[A-Z]{2,4}\d{3,8}\b', full_text)
+        if m3:
+            return m3.group(0)
+        return default_val or f"REF-{dossier_id[:8]}"
+
+    def extract_exact_event_id():
+        for l in lines_info:
+            m = re.search(r'\b(EVT|EVENT|LOG|SRC)[-:#\s]*([A-Za-z0-9_-]+)\b', l["text"], re.IGNORECASE)
+            if m:
+                return f"{m.group(1).upper()}-{m.group(2)}"
+        return lines_info[0]["sourceId"]
 
     # RULE 1: Quarantine Prompt Injections / Security Risks
     INJECTION_KEYWORDS = [
@@ -419,8 +455,8 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # RULE 2: Update Internal Record
     if "delivery" in full_text_lower or "delivery_window" in full_text_lower or "case_record" in full_text_lower or "reschedule" in full_text_lower:
         case_line_id = find_matching_line_id(["case", "delivery", "window", "reschedule", "event"])
-        case_ref = extract_ref(full_text, default=f"CASE-{dossier_id[:6]}")
-        event_ref = extract_ref(full_text, default=f"EVT-{dossier_id[:6]}")
+        case_ref = extract_exact_ref(f"CASE-{dossier_id[:6]}")
+        event_ref = extract_exact_event_id()
         val = "MORNING"
         if "evening" in full_text_lower:
             val = "EVENING"
@@ -442,8 +478,8 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # RULE 3: Send Approved Notice
     if "approved" in full_text_lower or "approved_delivery_notice" in full_text_lower or "approved notice" in full_text_lower:
         appr_line_id = find_matching_line_id(["approved", "notice", "email", "send"])
-        recip_email = extract_email(full_text, default="customer@example.com")
-        ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
+        recip_email = extract_exact_email("customer@example.com")
+        ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
         
         return {
             "dossierId": dossier_id,
@@ -460,8 +496,8 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # RULE 4: Request Confirmation
     if "unverified" in full_text_lower or "conflict" in full_text_lower or "ambiguous" in full_text_lower or "mismatch" in full_text_lower or "verify" in full_text_lower:
         conf_line_id = find_matching_line_id(["unverified", "sender", "conflict", "verify", "mismatch"])
-        claimed_sender = extract_email(full_text, default="sender@example.com")
-        ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
+        claimed_sender = extract_exact_email("sender@example.com")
+        ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
         
         return {
             "dossierId": dossier_id,
@@ -478,8 +514,8 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # RULE 5: Create Draft
     if "draft" in full_text_lower or "inquiry" in full_text_lower or "status" in full_text_lower or "order" in full_text_lower:
         draft_line_id = find_matching_line_id(["draft", "inquiry", "order", "status", "from"])
-        recip_email = extract_email(full_text, default="customer@example.com")
-        ref_id = extract_ref(full_text, default=f"ORD-{dossier_id[:6]}")
+        recip_email = extract_exact_email("customer@example.com")
+        ref_id = extract_exact_ref(f"ORD-{dossier_id[:6]}")
         
         return {
             "dossierId": dossier_id,
@@ -496,7 +532,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
 
     # RULE 6: Default / No Action
     first_line_id = all_lines[0][0] if all_lines else "L1"
-    ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
+    ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
     
     reason = "INFORMATIONAL"
     if "duplicate" in full_text_lower:
@@ -782,7 +818,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     init_environment()
     init_db()
-    port = int(os.path.environ.get('PORT', '10000'))
+    port = int(os.environ.get('PORT', '10000'))
     server = ThreadingHTTPServer(('0.0.0.0', port), RequestHandler)
     print(f"Unified Guardrail & Mailroom Gate server listening on port {port}...")
     server.serve_forever()
