@@ -53,13 +53,11 @@ def validate(raw):
         u=urllib.parse.urlsplit(raw)
         if u.scheme.lower()!='https': return False,'only public HTTPS URLs are accepted'
         if u.username is not None or u.password is not None: return False,'userinfo is not allowed'
-        host=u.hostname or ''
+        # DNS hostnames are case-insensitive. Normalize case, but do not strip
+        # a trailing dot because the sandbox policy says exact hosts.
+        host=(u.hostname or '').lower()
         if host not in ALLOWED: return False,'host is not allowlisted'
         if u.port not in (None,443): return False,'port is not allowed'
-        # The policy allowlists these exact public hostnames. Avoid an extra
-        # DNS gate that can reject an otherwise valid benign control because
-        # of transient resolver/IPv6 behavior in the hosting environment.
-        # SSRF lookalikes are already rejected by exact hostname matching.
         return True,''
     except Exception: return False,'invalid URL'
 
@@ -73,7 +71,7 @@ def fetch_tool(raw):
     ok,why=validate(raw)
     if not ok: fail(why)
     op=urllib.request.build_opener(Redirects())
-    req=urllib.request.Request(raw,headers={'User-Agent':'agent-guardrail/8.0'})
+    req=urllib.request.Request(raw,headers={'User-Agent':'agent-guardrail/9.0'})
     try:
         with op.open(req,timeout=10) as r: data=r.read(262144).decode('utf-8','replace')
     except PermissionError: raise
