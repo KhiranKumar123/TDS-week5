@@ -8,8 +8,14 @@ import time
 DEFAULT_Q3_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "invoice_agent_a2a.db")
 Q3_DB_PATH = os.environ.get("Q3_DB_PATH", DEFAULT_Q3_DB)
 
+def get_db_conn():
+    conn = sqlite3.connect(Q3_DB_PATH, timeout=60.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
+    return conn
+
 def init_q3_db():
-    conn = sqlite3.connect(Q3_DB_PATH)
+    conn = get_db_conn()
     c = conn.cursor()
     
     # Package decision cache
@@ -73,8 +79,15 @@ def canonical_json_bytes(obj) -> bytes:
 def compute_hash(obj) -> str:
     return hashlib.sha256(canonical_json_bytes(obj)).hexdigest().lower()
 
+def get_header(headers: dict, name: str):
+    name_lower = name.lower()
+    for k, v in headers.items():
+        if k.lower() == name_lower:
+            return v
+    return None
+
 def extract_principal(headers: dict) -> str:
-    auth = headers.get('Authorization') or headers.get('authorization') or ''
+    auth = get_header(headers, 'Authorization') or ''
     if auth.startswith('Bearer '):
         token = auth[7:].strip()
         if token:
@@ -84,7 +97,7 @@ def extract_principal(headers: dict) -> str:
 def analyze_invoice_package(pkg: dict) -> dict:
     pkg_fingerprint = compute_hash(pkg)
     
-    conn = sqlite3.connect(Q3_DB_PATH)
+    conn = get_db_conn()
     c = conn.cursor()
     c.execute('SELECT action, facts_json, evidence_json, rationale FROM package_decision_cache WHERE package_fingerprint = ?', (pkg_fingerprint,))
     row = c.fetchone()
@@ -97,11 +110,7 @@ def analyze_invoice_package(pkg: dict) -> dict:
             "rationale": row[3]
         }
 
-    # Deep text extraction & rule engine for invoice package
-    text_content = ""
-    if isinstance(pkg, dict):
-        text_content = json.dumps(pkg, ensure_ascii=False)
-        
+    text_content = json.dumps(pkg, ensure_ascii=False) if isinstance(pkg, dict) else str(pkg)
     text_lower = text_content.lower()
     
     # Extract bracketed evidence references [Ref...] or [E...] or [EV...]
@@ -133,13 +142,6 @@ def analyze_invoice_package(pkg: dict) -> dict:
         "currency": currency
     }
 
-    # Action Determination Logic based on A2A Invoice Rules:
-    # 1. reject_duplicate: paid, duplicate, already processed
-    # 2. hold_invoice: pause, verification pending, compliance check
-    # 3. open_exception: conflict, discrepancy, mismatch, material error
-    # 4. request_approval: outside authority, limit exceeded, high value
-    # 5. settle_invoice: valid, reconciled, autonomous authority
-
     if any(w in text_lower for w in ["duplicate", "already paid", "previously settled", "already_paid"]):
         action = "reject_duplicate"
         rationale_desc = f"Action reject_duplicate selected because the invoice {invoice_number} from {vendor_name} has already been paid per evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
@@ -156,7 +158,6 @@ def analyze_invoice_package(pkg: dict) -> dict:
         action = "settle_invoice"
         rationale_desc = f"Action settle_invoice selected as invoice {invoice_number} is valid, reconciled, and within autonomous payment authority per evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
 
-    # Ensure rationale length is strictly 60 to 1500 chars
     if len(rationale_desc) < 60:
         rationale_desc = rationale_desc + " This proposal complies with A2A 1.0 invoice governance policy."
 
@@ -212,12 +213,14 @@ def get_agent_card(base_url: str) -> dict:
     }
 
 def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, base_url: str):
-    # 1. Discovery Path (.well-known/agent-card.json) - Public, no auth required
-    if method == 'GET' and (path == '/.well-known/agent-card.json' or path.endswith('/.well-known/agent-card.json')):
+    clean_path = path.split('?')[0]
+    
+    # 1. Discovery Path (.well-known/agent-card.json) - Public
+    if method == 'GET' and (clean_path == '/.well-known/agent-card.json' or clean_path.endswith('/.well-known/agent-card.json')):
         return 200, get_agent_card(base_url)
 
     # 2. Version Verification
-    a2a_ver = headers.get('A2A-Version') or headers.get('a2a-version')
+    a2a_ver = get_header(headers, 'A2A-Version')
     if a2a_ver and a2a_ver != '1.0':
         return 400, {"error": {"code": "INVALID_VERSION", "message": "A2A-Version must be 1.0"}}
 
@@ -226,12 +229,11 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
     if not principal:
         return 401, {"error": {"code": "UNAUTHENTICATED", "message": "Missing or invalid Bearer token"}}
 
-    # Connect DB
-    conn = sqlite3.connect(Q3_DB_PATH)
+    conn = get_db_conn()
     c = conn.cursor()
 
     # ROUTE: GET {base}tasks (List tasks for principal)
-    if method == 'GET' and (path == '/a2a/tasks' or path == '/a2a/tasks/'):
+    if method == 'GET' and (clean_path == '/a2a/tasks' or clean_path == '/a2a/tasks/' or clean_path.endswith('/tasks')):
         c.execute('SELECT task_json FROM a2a_tasks WHERE principal = ? ORDER BY created_at DESC', (principal,))
         rows = c.fetchall()
         conn.close()
@@ -239,19 +241,18 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
         return 200, {"tasks": tasks}
 
     # ROUTE: GET {base}tasks/{id} (Get single task)
-    m_get_task = re.match(r'^/a2a/tasks/([A-Za-z0-9_-]+)$', path)
-    if method == 'GET' and m_get_task:
+    m_get_task = re.search(r'/tasks/([A-Za-z0-9_-]+)$', clean_path)
+    if method == 'GET' and m_get_task and not clean_path.endswith(':cancel'):
         t_id = m_get_task.group(1)
         c.execute('SELECT principal, task_json FROM a2a_tasks WHERE task_id = ?', (t_id,))
         row = c.fetchone()
         conn.close()
         if not row or row[0] != principal:
-            # User isolation: return 404 with generic error body
             return 404, {"error": {"code": "NOT_FOUND", "message": "Task not found"}}
         return 200, json.loads(row[1])
 
     # ROUTE: POST {base}tasks/{id}:cancel (Cancel nonterminal task)
-    m_cancel_task = re.match(r'^/a2a/tasks/([A-Za-z0-9_-]+):cancel$', path)
+    m_cancel_task = re.search(r'/tasks/([A-Za-z0-9_-]+):cancel$', clean_path)
     if method == 'POST' and m_cancel_task:
         t_id = m_cancel_task.group(1)
         c.execute('SELECT principal, status, task_json FROM a2a_tasks WHERE task_id = ?', (t_id,))
@@ -265,7 +266,6 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
 
         if status in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
             conn.close()
-            # Cancel vs Result Race: return 409 if already terminal
             return 409, {"error": {"code": "TASK_TERMINAL", "message": "Task is already in terminal state"}}
 
         task_obj["status"] = "TASK_STATE_CANCELED"
@@ -276,7 +276,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
         return 200, task_obj
 
     # ROUTE: POST {base}message:send
-    if method == 'POST' and (path == '/a2a/message:send' or path == '/a2a/message:send/'):
+    if method == 'POST' and (clean_path.endswith('/message:send') or clean_path.endswith('/message:send/')):
         try:
             req_body = json.loads(raw_body.decode('utf-8'))
         except Exception:
@@ -295,7 +295,6 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
 
         msg_hash = compute_hash(message_obj)
 
-        # Check Idempotency (Bearer principal, messageId)
         c.execute('SELECT message_hash, task_id, response_json FROM message_idempotency WHERE principal = ? AND message_id = ?',
                   (principal, msg_id))
         idem_row = c.fetchone()
@@ -474,4 +473,3 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
 
     conn.close()
     return 404, {"error": {"code": "NOT_FOUND", "message": "Unknown A2A route"}}
-

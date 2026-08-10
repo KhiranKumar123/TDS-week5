@@ -261,8 +261,14 @@ def handle_fetch_url(url_arg):
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mailroom_v2.db")
 DB_PATH = os.environ.get("DB_PATH", DEFAULT_DB)
 
+def get_db_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_conn()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS dossier_cache (
@@ -535,7 +541,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # ROUTER STEP A: Question 3 A2A Protocol Routes (Agent Card, Tasks List, Task View)
-        if self.path == '/.well-known/agent-card.json' or self.path.startswith('/a2a'):
+        if self.path == '/.well-known/agent-card.json' or self.path.startswith('/a2a') or '/tasks' in self.path:
             base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
             headers_dict = {k: v for k, v in self.headers.items()}
             code, resp_data = q3_invoice_agent.handle_a2a_route(self.path, 'GET', headers_dict, b'', base_url)
@@ -553,7 +559,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             raw_body = self.rfile.read(content_length)
 
             # ROUTER STEP A: Question 3 A2A Protocol POST Routes (/a2a/message:send, /a2a/tasks/{id}:cancel)
-            if self.path.startswith('/a2a'):
+            if self.path.startswith('/a2a') or 'message:send' in self.path or '/tasks/' in self.path:
                 base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
                 headers_dict = {k: v for k, v in self.headers.items()}
                 code, resp_data = q3_invoice_agent.handle_a2a_route(self.path, 'POST', headers_dict, raw_body, base_url)
@@ -591,6 +597,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else:
                     return self.reply(400, {'error': 'unknown or missing operation'})
 
+            # ROUTER STEP D: Fallback check for A2A payload structure if path was base path
+            elif isinstance(req, dict) and ('message' in req or 'parts' in req):
+                base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
+                headers_dict = {k: v for k, v in self.headers.items()}
+                code, resp_data = q3_invoice_agent.handle_a2a_route('/a2a/message:send', 'POST', headers_dict, raw_body, base_url)
+                media_type = 'application/a2a+json' if code == 200 else 'application/json; charset=utf-8'
+                return self.reply(code, resp_data, media_type)
+
             else:
                 return self.reply(400, {'error': 'unrecognized request payload format'})
 
@@ -616,7 +630,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         input_digest = compute_input_digest(dossiers)
         request_hash = hashlib.sha256(raw_body).hexdigest().lower()
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_conn()
         c = conn.cursor()
 
         c.execute('SELECT input_digest, request_hash, propose_response_json FROM evaluation_state WHERE evaluation_id = ?', (eval_id,))
@@ -708,7 +722,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if receipts is None or not isinstance(receipts, list):
             return self.reply(400, {'error': 'missing or invalid receipts list'})
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_conn()
         c = conn.cursor()
 
         c.execute('SELECT input_digest, verifier_jwk_json, commit_response_json, status FROM evaluation_state WHERE evaluation_id = ?', (eval_id,))
