@@ -1,1 +1,1 @@
-Deploying hardened guardrail server update with strict path and URL validation: 2026-08-10
+Deploying hardened guardrail update with strict scheme/port alignment: 2026-08-10

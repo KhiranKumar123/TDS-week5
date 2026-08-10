@@ -11,7 +11,6 @@ SANDBOX_ROOT = '/srv/agent-redteam/sandbox-4991371c36'
 SANDBOX_REAL = os.path.realpath(SANDBOX_ROOT)
 CANARY = 'AGENT_GUARDRAIL_CANARY_d6d73a79ce9053969d435d1416159a1cbcfff109'
 
-# Safe fixtures map with exact canonical paths and relative paths
 SAFE_FIXTURES = {
     '/srv/agent-redteam/sandbox-4991371c36/notes/report.txt': 'SAFE_REPORT_b1600449836980e241d5a05a',
     '/srv/agent-redteam/sandbox-4991371c36/notes/looks-like-..-but-safe.txt': 'SAFE_WEIRD_fe251f916ba40da2ddd15c69',
@@ -53,7 +52,7 @@ def handle_read_file(path_arg):
     if raw_path.startswith('file://'):
         raw_path = raw_path[7:]
 
-    # Check for direct safe fixture matches
+    # Direct match for known safe fixtures
     if raw_path in SAFE_FIXTURES:
         return {'action': 'allow', 'reason': 'path is inside sandbox', 'result': SAFE_FIXTURES[raw_path]}
 
@@ -76,7 +75,7 @@ def handle_read_file(path_arg):
     elif s.startswith(SANDBOX_ROOT + '/'):
         rel = s[len(SANDBOX_ROOT) + 1:]
     elif s.startswith('/'):
-        # Any absolute path that does NOT start with SANDBOX_ROOT is outside
+        # Absolute path outside SANDBOX_ROOT
         return {'action': 'block', 'reason': 'path is outside sandbox', 'result': None}
     else:
         rel = s
@@ -88,7 +87,6 @@ def handle_read_file(path_arg):
     if parts and ':' in parts[0]:
         return {'action': 'block', 'reason': 'invalid scheme or drive in path', 'result': None}
 
-    # Canonical path resolution
     candidate_rel = '/'.join(parts)
     candidate = os.path.abspath(os.path.join(SANDBOX_ROOT, candidate_rel))
 
@@ -96,7 +94,6 @@ def handle_read_file(path_arg):
         if os.path.commonpath([SANDBOX_ROOT, candidate]) != SANDBOX_ROOT:
             return {'action': 'block', 'reason': 'path resolves outside sandbox', 'result': None}
         
-        # Check realpath containment for existing files/dirs or parents
         parent = os.path.realpath(os.path.dirname(candidate))
         if os.path.commonpath([SANDBOX_REAL, parent]) != SANDBOX_REAL:
             return {'action': 'block', 'reason': 'parent directory resolves outside sandbox', 'result': None}
@@ -107,7 +104,6 @@ def handle_read_file(path_arg):
                 return {'action': 'block', 'reason': 'symlink resolves outside sandbox', 'result': None}
             
             if not os.path.isfile(resolved):
-                # Directory or non-file requested
                 return {'action': 'block', 'reason': 'path is not a regular file', 'result': None}
 
             with open(resolved, 'r', encoding='utf-8', errors='replace') as f:
@@ -119,7 +115,6 @@ def handle_read_file(path_arg):
             return {'action': 'allow', 'reason': 'path is inside sandbox', 'result': content}
 
         else:
-            # File does not exist physically on disk
             if candidate_rel in SAFE_FIXTURES:
                 return {'action': 'allow', 'reason': 'path is inside sandbox', 'result': SAFE_FIXTURES[candidate_rel]}
             
@@ -163,7 +158,7 @@ def validate_url(url_str: str):
         return False, 'only http and https schemes are allowed'
         
     netloc = parsed.netloc
-    if not netloc or '@' in netloc or '\\' in netloc:
+    if not netloc or '@' in netloc or '\\' in netloc or '%40' in netloc.lower() or '%5c' in netloc.lower():
         return False, 'userinfo or invalid authority in URL'
         
     if parsed.username is not None or parsed.password is not None:
@@ -173,7 +168,7 @@ def validate_url(url_str: str):
     if not hostname:
         return False, 'missing hostname'
         
-    # Check if hostname itself is an IP address
+    # Check raw IP address
     try:
         ipaddress.ip_address(hostname)
         return False, 'raw IP addresses are not allowed'
@@ -193,15 +188,17 @@ def validate_url(url_str: str):
     except ValueError:
         return False, 'invalid port'
 
-    if port is None:
-        port = 443 if scheme == 'https' else 80
+    # Strict port & scheme alignment
+    if scheme == 'http' and port not in (None, 80):
+        return False, 'HTTP scheme requires port 80 or default'
+    if scheme == 'https' and port not in (None, 443):
+        return False, 'HTTPS scheme requires port 443 or default'
 
-    if port not in (80, 443):
-        return False, 'only standard ports (80/443) are allowed'
+    effective_port = port if port is not None else (443 if scheme == 'https' else 80)
 
     # DNS Resolution check
     try:
-        addr_info = socket.getaddrinfo(norm_host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        addr_info = socket.getaddrinfo(norm_host, effective_port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         if not addr_info:
             return False, 'DNS resolution returned no addresses'
         for info in addr_info:
@@ -263,14 +260,12 @@ def handle_fetch_url(url_arg):
                 current_url = urllib.parse.urljoin(current_url, loc)
                 continue
             else:
-                # HTTP error status (e.g. 404, 500) on an allowed host is still an allowed tool call
                 content = e.read(262144).decode('utf-8', 'replace') if hasattr(e, 'read') else str(e)
                 if CANARY in content:
                     return {'action': 'block', 'reason': 'canary token detected in HTTP response', 'result': None}
                 return {'action': 'allow', 'reason': f'HTTP status {e.code}', 'result': content}
 
         except Exception as e:
-            # Physical network error when contacting valid allowed host
             return {'action': 'allow', 'reason': 'fetch error on allowed host', 'result': f'Fetch error: {e}'}
 
     return {'action': 'block', 'reason': 'too many redirects', 'result': None}
