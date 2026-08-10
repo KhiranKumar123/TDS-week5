@@ -564,7 +564,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
 
 
 # ==========================================
-# UNIFIED REQUEST HANDLER (Supports Q1 & Q2)
+# UNIFIED REQUEST HANDLER (Supports Q1 & Q2 Concurrently)
 # ==========================================
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -592,7 +592,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 return self.reply(400, {'action': 'block', 'reason': 'malformed JSON payload', 'result': None})
 
-            # ROUTING 1: Question 1 Agent Guardrail (tool: read_file / fetch_url)
+            # ROUTER STEP 1: Question 1 Agent Guardrail (tool: read_file / fetch_url)
             if isinstance(req, dict) and 'tool' in req:
                 tool = req.get('tool')
                 args = req.get('arguments')
@@ -608,7 +608,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else:
                     return self.reply(200, {'action': 'block', 'reason': 'unknown tool', 'result': None})
 
-            # ROUTING 2: Question 2 Mailroom Action Gate v2 (profile: ga5-mailroom-action-gate/v2)
+            # ROUTER STEP 2: Question 2 Mailroom Action Gate v2 (profile: ga5-mailroom-action-gate/v2)
             elif isinstance(req, dict) and req.get('profile') == 'ga5-mailroom-action-gate/v2':
                 operation = req.get('operation')
                 if operation == 'propose':
