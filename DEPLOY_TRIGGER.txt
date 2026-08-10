@@ -1,1 +1,1 @@
-Deploying host variant support: 2026-08-10
+Deploying GA5 Mailroom Action Gate v2 service: 2026-08-10
