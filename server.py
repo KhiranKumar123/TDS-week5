@@ -399,7 +399,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         m = re.search(r'\b(CASE|ORD|REF|TKT|REQ)-?[A-Za-z0-9_-]+\b', all_text, re.IGNORECASE)
         if m:
             return m.group(0)
-        return default_val or f"CASE-{dossier_id[:6]}"
+        return default_val or f"REF-{dossier_id[:8]}"
 
     def extract_event_id(default_val=None):
         m = re.search(r'\b(EVT|SRC|EVENT|LOG)-?[A-Za-z0-9_-]+\b', all_text, re.IGNORECASE)
@@ -407,6 +407,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             return m.group(0)
         return default_val or lines_info[0]["sourceId"] or f"EVT-{dossier_id[:6]}"
 
+    # --- 1. PROMPT INJECTION / ATTACK CHECK (quarantine_item) ---
     INJECTION_KEYWORDS = [
         "ignore previous instructions", "ignore all prior", "disregard previous",
         "system override", "secret canary", "canary:", "admin prompt", "print api key",
@@ -430,6 +431,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                     "evidence": [l["lineId"]]
                 }
 
+    # --- 2. CHECK INTERNAL AUTHORIZED OUTBOUND SEND (send_approved_notice) ---
     has_internal_approval = False
     approval_line_id = None
     
@@ -443,7 +445,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
 
     if has_internal_approval:
         recip = extract_email("customer@example.com")
-        ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
+        ref_id = extract_case_id(f"REF-{dossier_id[:8]}")
         evidence = [approval_line_id]
         recip_line_id = find_line_id(lambda l: "@" in l["text"])
         if recip_line_id and recip_line_id not in evidence:
@@ -461,6 +463,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             "evidence": sorted(list(set(evidence)))
         }
 
+    # --- 3. CHECK INTERNAL RECORD UPDATE (update_internal_record) ---
     has_internal_update = False
     update_line_id = None
     
@@ -472,7 +475,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             break
 
     if has_internal_update:
-        case_id = extract_case_id(f"CASE-{dossier_id[:6]}")
+        case_id = extract_case_id(f"CASE-{dossier_id[:8]}")
         event_id = extract_event_id(lines_info[0]["sourceId"])
         val = "MORNING"
         if "evening" in all_text_lower:
@@ -492,6 +495,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             "evidence": [update_line_id]
         }
 
+    # --- 4. CHECK UNVERIFIED / CONFIRMATION REQUEST (request_confirmation) ---
     is_unverified = False
     conf_line_id = None
     
@@ -504,7 +508,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
 
     if is_unverified:
         sender = extract_email("sender@example.com")
-        ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
+        ref_id = extract_case_id(f"REF-{dossier_id[:8]}")
         return {
             "dossierId": dossier_id,
             "action": "request_confirmation",
@@ -517,6 +521,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             "evidence": [conf_line_id]
         }
 
+    # --- 5. CHECK CREATE DRAFT (create_draft) ---
     is_customer_inquiry = False
     draft_line_id = None
     
@@ -529,7 +534,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
 
     if is_customer_inquiry:
         recip = extract_email("customer@example.com")
-        ref_id = extract_case_id(f"ORD-{dossier_id[:6]}")
+        ref_id = extract_case_id(f"ORD-{dossier_id[:8]}")
         return {
             "dossierId": dossier_id,
             "action": "create_draft",
@@ -543,8 +548,9 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             "evidence": [draft_line_id]
         }
 
+    # --- 6. DEFAULT / NO ACTION (no_action) ---
     first_line_id = lines_info[0]["lineId"]
-    ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
+    ref_id = extract_case_id(f"REF-{dossier_id[:8]}")
     reason = "INFORMATIONAL"
     if "duplicate" in all_text_lower:
         reason = "DUPLICATE"
@@ -651,9 +657,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         if row:
             stored_digest, stored_req_hash, stored_response_json = row[0], row[1], row[2]
             conn.close()
-            if stored_digest == input_digest and stored_response_json:
+            # If the raw body matches stored request hash, exact replay
+            if stored_req_hash == request_hash and stored_response_json:
                 return self.reply(200, json.loads(stored_response_json))
             else:
+                # Any change in content for same evaluationId MUST return HTTP 409 Conflict
                 return self.reply(409, {'error': 'changed content conflict for same evaluationId'})
 
         jwk_json = json.dumps(verifier['publicKeyJwk'])
