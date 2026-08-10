@@ -542,7 +542,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # ROUTER STEP A: Question 4 Incident Agent Routes (/v2/incidents)
-        if self.path.startswith('/v2/incidents'):
+        if 'incidents' in self.path or self.path.startswith('/v2/incidents'):
             headers_dict = {k: v for k, v in self.headers.items()}
             code, resp_data = q4_incident_agent.handle_incident_route(self.path, 'GET', headers_dict, b'')
             return self.reply(code, resp_data)
@@ -561,7 +561,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             is_a2a_route = self.path.startswith('/a2a') or 'message:send' in self.path or '/tasks/' in self.path
-            is_q4_route = self.path.startswith('/v2/incidents')
+            is_q4_route = 'incidents' in self.path or self.path.startswith('/v2/incidents')
             
             if not is_a2a_route and not is_q4_route and (content_length <= 0 or content_length > 786432):
                 return self.reply(400, {'action': 'block', 'reason': 'invalid content length', 'result': None})
