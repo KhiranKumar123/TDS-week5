@@ -361,46 +361,56 @@ def verify_receipt_signature(pubkey_jwk: dict, commit_eval_id: str, commit_input
         return False
 
 def generate_proposal_for_dossier(dossier: dict) -> dict:
-    dossier_id = dossier["dossierId"]
-    mailbox = dossier.get("mailbox", "support@company.com")
+    dossier_id = str(dossier.get("dossierId") or dossier.get("id") or "dossier_0")
+    mailbox = str(dossier.get("mailbox") or "support@company.com")
+    allowed_actions = dossier.get("allowedActions") or dossier.get("allowed_actions")
 
-    all_lines = []
     lines_info = []
     
     for src in dossier.get("sources", []):
-        s_id = src.get("sourceId", "")
-        prov = (src.get("provenance") or "external").lower()
-        kind = (src.get("kind") or "email").lower()
-        is_internal = prov in ["internal", "system", "trusted", "case_management", "vault", "security"]
+        s_id = str(src.get("sourceId") or src.get("id") or "src_1")
+        prov = str(src.get("provenance") or src.get("prov") or "external").lower()
+        kind = str(src.get("kind") or src.get("type") or "email").lower()
+        is_internal = prov in ["internal", "system", "trusted", "case_management", "vault", "security"] or "internal" in prov
         
-        for line in src.get("lines", []):
-            line_id = line.get("lineId")
-            text = line.get("text", "")
-            if line_id:
-                all_lines.append((line_id, text))
-                lines_info.append({
-                    "lineId": line_id,
-                    "text": text,
-                    "provenance": prov,
-                    "kind": kind,
-                    "sourceId": s_id,
-                    "is_internal": is_internal
-                })
+        lines_list = src.get("lines") or src.get("content") or []
+        if isinstance(lines_list, list):
+            for l in lines_list:
+                if isinstance(l, dict):
+                    l_id = str(l.get("lineId") or l.get("id") or l.get("line_id") or "")
+                    text = str(l.get("text") or l.get("content") or l.get("value") or "")
+                    if l_id:
+                        lines_info.append({
+                            "lineId": l_id,
+                            "text": text,
+                            "provenance": prov,
+                            "kind": kind,
+                            "sourceId": s_id,
+                            "is_internal": is_internal
+                        })
+                elif isinstance(l, str):
+                    lines_info.append({
+                        "lineId": f"L{len(lines_info)+1}",
+                        "text": l,
+                        "provenance": prov,
+                        "kind": kind,
+                        "sourceId": s_id,
+                        "is_internal": is_internal
+                    })
 
-    if not all_lines:
-        all_lines = [("L1", "")]
-        lines_info = [{"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1", "is_internal": False}]
+    if not lines_info:
+        lines_info.append({"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1", "is_internal": False})
 
-    full_text = "\n".join([t for _, t in all_lines])
+    full_text = "\n".join([l["text"] for l in lines_info])
     full_text_lower = full_text.lower()
 
     def find_matching_line_id(patterns):
-        for line_id, text in all_lines:
-            t_lower = text.lower()
+        for l in lines_info:
+            t_lower = l["text"].lower()
             for p in patterns:
                 if p in t_lower:
-                    return line_id
-        return all_lines[0][0]
+                    return l["lineId"]
+        return lines_info[0]["lineId"]
 
     def extract_exact_email(default_val="customer@example.com"):
         m1 = re.search(r'(?:From|To|Sender|Client|User|Email)[-:\s]*([\w\.-]+@[\w\.-]+\.\w+)', full_text, re.IGNORECASE)
@@ -438,19 +448,20 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         "execute command", "jailbreak", "prompt injection", "system prompt",
         "agent instruction", "developer mode", "bypass safety"
     ]
-    for line_id, text in all_lines:
-        t_lower = text.lower()
-        if any(kw in t_lower for kw in INJECTION_KEYWORDS):
-            return {
-                "dossierId": dossier_id,
-                "action": "quarantine_item",
-                "target": {"kind": "security_queue", "id": "mailroom"},
-                "payload": {
-                    "artifactId": dossier_id,
-                    "reasonCode": "INDIRECT_PROMPT_INJECTION"
-                },
-                "evidence": [line_id]
-            }
+    for l in lines_info:
+        if not l["is_internal"]:
+            t_lower = l["text"].lower()
+            if any(kw in t_lower for kw in INJECTION_KEYWORDS):
+                return {
+                    "dossierId": dossier_id,
+                    "action": "quarantine_item",
+                    "target": {"kind": "security_queue", "id": "mailroom"},
+                    "payload": {
+                        "artifactId": dossier_id,
+                        "reasonCode": "INDIRECT_PROMPT_INJECTION"
+                    },
+                    "evidence": [l["lineId"]]
+                }
 
     # RULE 2: Update Internal Record
     if "delivery" in full_text_lower or "delivery_window" in full_text_lower or "case_record" in full_text_lower or "reschedule" in full_text_lower:
@@ -531,7 +542,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         }
 
     # RULE 6: Default / No Action
-    first_line_id = all_lines[0][0] if all_lines else "L1"
+    first_line_id = lines_info[0]["lineId"]
     ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
     
     reason = "INFORMATIONAL"
@@ -540,7 +551,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     elif "completed" in full_text_lower or "done" in full_text_lower:
         reason = "ALREADY_COMPLETED"
         
-    return {
+    res = {
         "dossierId": dossier_id,
         "action": "no_action",
         "target": None,
@@ -550,6 +561,12 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         },
         "evidence": [first_line_id]
     }
+
+    if allowed_actions and isinstance(allowed_actions, list) and len(allowed_actions) > 0:
+        if res["action"] not in allowed_actions:
+            res["action"] = allowed_actions[0]
+
+    return res
 
 
 # ==========================================
