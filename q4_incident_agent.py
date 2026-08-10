@@ -85,7 +85,6 @@ def analyze_incident(incident_data: dict) -> dict:
     transcript = incident_data.get("transcript", "")
     allowed_causes = incident_data.get("allowedRootCauses", [])
     
-    # Extract evidence IDs (ev_...)
     found_ev = RE_EV_BRACKETS.findall(transcript)
     if not found_ev:
         found_ev = re.findall(r'\[([A-Za-z0-9_-]+)\]', transcript)
@@ -182,7 +181,6 @@ def build_otlp_trace(state: dict) -> dict:
         attempt = disp.get("attempt", 1)
         traceparent = disp.get("traceparent", "")
         
-        # Extract CLIENT span ID from traceparent (00-traceId-spanId-01)
         tp_parts = traceparent.split('-')
         client_span_id = tp_parts[2] if len(tp_parts) >= 4 else f"{hashlib.md5((act_id + str(attempt)).encode()).hexdigest()[:16]}"
         logical_span_id = f"{hashlib.md5((run_id + act_id).encode()).hexdigest()[:16]}"
@@ -286,7 +284,8 @@ def build_otlp_trace(state: dict) -> dict:
     }
 
 def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes):
-    clean_path = path.split('?')[0].rstrip('/')
+    clean_path = path.split('?')[0]
+    clean_path = re.sub(r'/+', '/', clean_path).rstrip('/')
     
     conn = get_q4_db_conn()
     c = conn.cursor()
@@ -320,7 +319,6 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
 
         rec_hash = compute_hash(receipt_req)
 
-        # Check receipt conflict (same receiptId with changed content -> 409)
         c.execute('SELECT receipt_hash FROM incident_receipts WHERE receipt_id = ?', (rec_id,))
         r_row = c.fetchone()
         if r_row:
@@ -363,7 +361,6 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
 
             # Check 503 Retry
             if status_code == 503 and attempt < 2:
-                # Find dispatch to retry
                 retry_disp = None
                 for d in state["actionLog"]:
                     if d["actionId"] == act_id:
@@ -393,7 +390,6 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
                 chosen_effect = effect_tools[0] if effect_tools else "scale_service"
                 state["chosenEffect"] = chosen_effect
 
-                # Find tool catalog info for effect arguments
                 catalog = input_data.get("toolCatalog", [])
                 eff_tool_info = next((t for t in catalog if t["name"] == chosen_effect), {"name": chosen_effect})
                 eff_args = generate_tool_arguments(eff_tool_info, input_data.get("incident", {}))
@@ -446,7 +442,6 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
                     "nonce": nonce_val
                 })
 
-                # Find pending approval actionId
                 policy = input_data.get("policy", {})
                 effect_tools = policy.get("effectTools", ["scale_service"])
                 chosen_effect = state.get("chosenEffect") or (effect_tools[0] if effect_tools else "scale_service")
@@ -478,10 +473,8 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
                 state["dispatches"] = []
                 state["approvals"] = []
 
-        # Rebuild OTLP trace
         state["otlp"] = build_otlp_trace(state)
 
-        # Update DB
         c.execute('UPDATE incident_runs SET status = ?, state_json = ?, updated_at = CURRENT_TIMESTAMP WHERE run_id = ?',
                   (state["status"], json.dumps(state), run_id))
         
@@ -511,7 +504,6 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
 
         req_hash = compute_hash(req_body)
 
-        # Check runId conflict / replay
         c.execute('SELECT request_hash, state_json FROM incident_runs WHERE run_id = ?', (run_id,))
         run_row = c.fetchone()
         if run_row:
@@ -522,11 +514,9 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
             else:
                 return 409, {"error": "runId conflict with changed content"}
 
-        # Analyze incident
         incident_info = req_body.get("incident", {})
         diag = analyze_incident(incident_info)
 
-        # Separate diagnostic tools from effect tools
         catalog = req_body.get("toolCatalog", [])
         policy = req_body.get("policy", {})
         effect_tool_names = policy.get("effectTools", [])
@@ -535,7 +525,6 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
         if not diag_catalog:
             diag_catalog = catalog[:1] if catalog else [{"name": "query_metrics", "inputSchema": {}}]
 
-        # Build 1 to 3 diagnostic dispatches before effects
         max_diag = min(policy.get("maximumDiagnostics", 3), len(diag_catalog))
         if max_diag < 1:
             max_diag = 1
@@ -554,8 +543,6 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
             traceparent = f"00-{trace_id}-{client_span_id}-01"
 
             args = generate_tool_arguments(tool_info, incident_info)
-
-            # Assign non-duplicate subset of evidence IDs
             ev_subset = [diag["evidence"][idx % len(diag["evidence"])]]
 
             disp = {
@@ -584,10 +571,8 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
             "suppressed": []
         }
 
-        # Build OTLP trace
         state["otlp"] = build_otlp_trace(state)
 
-        # Store in DB
         c.execute('''
             INSERT INTO incident_runs (run_id, request_hash, status, input_json, state_json)
             VALUES (?, ?, ?, ?, ?)
