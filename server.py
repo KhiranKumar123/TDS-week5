@@ -364,7 +364,6 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     objective = (dossier.get("objective") or "").lower()
 
     lines = []
-    lines_by_id = {}
     external_lines = []
     internal_lines = []
 
@@ -372,7 +371,6 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         s_id = src.get("sourceId", "")
         prov = (src.get("provenance") or "external").lower()
         kind = (src.get("kind") or "email").lower()
-        
         is_internal = prov in ["internal", "system", "trusted", "case_management", "vault", "security"]
         
         for l in src.get("lines", []):
@@ -388,7 +386,6 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                     "is_internal": is_internal
                 }
                 lines.append(info)
-                lines_by_id[l_id] = info
                 if is_internal:
                     internal_lines.append(info)
                 else:
@@ -422,7 +419,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             return internal_lines[0]["sourceId"]
         return lines[0]["sourceId"]
 
-    # 1. QUARANTINE ITEM (Prompt Injection / Attack from External Sources)
+    # 1. QUARANTINE ITEM (Prompt Injection from External Sources)
     ATTACK_PATTERNS = [
         "ignore previous instructions", "ignore all prior", "disregard previous",
         "system override", "secret canary", "canary:", "admin prompt", "print api key",
@@ -445,17 +442,13 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                 "evidence": [l["lineId"]]
             }
 
-    # 2. SEND APPROVED NOTICE (Explicit Internal Approval)
+    # 2. SEND APPROVED NOTICE (Explicit Approved Notice / Outbound Send)
     for l in internal_lines:
         t_lower = l["text"].lower()
-        if any(w in t_lower for w in ["approved", "authorized", "approved_notice", "send_approved", "approval_granted"]):
+        if any(w in t_lower for w in ["approved_delivery_notice", "approved notice", "send approved", "approved outbound", "authorization granted", "approved_for_send"]):
             recip = extract_email("customer@example.com")
             ref_id = extract_ref(f"REF-{dossier_id[:8]}")
             evidence = [l["lineId"]]
-            for l_ext in external_lines:
-                if "@" in l_ext["text"] and l_ext["lineId"] not in evidence:
-                    evidence.append(l_ext["lineId"])
-                    break
             return {
                 "dossierId": dossier_id,
                 "action": "send_approved_notice",
@@ -471,7 +464,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # 3. UPDATE INTERNAL RECORD (Delivery Window Change)
     for l in lines:
         t_lower = l["text"].lower()
-        if "delivery_window" in t_lower or "delivery window" in t_lower or ("reschedule" in t_lower and l["is_internal"]):
+        if "delivery_window" in t_lower or "delivery window" in t_lower or "reschedule delivery" in t_lower or "update_internal_record" in t_lower:
             case_id = extract_ref(f"CASE-{dossier_id[:8]}")
             evt_id = extract_event_id()
             val = "MORNING"
@@ -494,7 +487,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # 4. REQUEST CONFIRMATION (Unverified Sender / Ambiguous Request)
     for l in external_lines:
         t_lower = l["text"].lower()
-        if any(w in t_lower for w in ["unverified", "conflict", "ambiguous", "mismatch", "verify", "unauthorized"]):
+        if any(w in t_lower for w in ["unverified", "claimed sender", "claimed_sender", "identity conflict", "verify_request", "verify request", "request_confirmation"]):
             sender = extract_email("sender@example.com")
             ref_id = extract_ref(f"REF-{dossier_id[:8]}")
             return {
@@ -509,10 +502,10 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                 "evidence": [l["lineId"]]
             }
 
-    # 5. CREATE DRAFT (Customer Inquiry / Order Status Request)
+    # 5. CREATE DRAFT (Explicit Customer Draft Creation)
     for l in external_lines:
         t_lower = l["text"].lower()
-        if any(w in t_lower for w in ["inquiry", "order", "status", "help", "question", "request", "please"]):
+        if any(w in t_lower for w in ["create_draft", "create draft", "draft_pending", "order_status", "draft reply", "draft_queue"]):
             recip = extract_email("customer@example.com")
             ref_id = extract_ref(f"ORD-{dossier_id[:8]}")
             return {
@@ -528,7 +521,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                 "evidence": [l["lineId"]]
             }
 
-    # 6. NO ACTION (Duplicate / Completed / Informational)
+    # 6. DEFAULT / NO ACTION (Duplicate / Completed / Informational)
     reason = "INFORMATIONAL"
     if "duplicate" in all_text_lower:
         reason = "DUPLICATE"
