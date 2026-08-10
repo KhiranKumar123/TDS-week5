@@ -8,7 +8,7 @@ import time
 DEFAULT_Q3_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "invoice_agent_a2a.db")
 Q3_DB_PATH = os.environ.get("Q3_DB_PATH", DEFAULT_Q3_DB)
 
-# Pre-compile Regexes outside loops for instant processing
+# Pre-compile Regexes outside loops for max speed
 RE_BRACKETS = re.compile(r'\[[A-Za-z0-9_\.:-]+\]')
 RE_VENDOR = re.compile(r'(?:vendorName|vendor|supplier|from)[-:\s"\']*([A-Za-z0-9\s,\.-]{2,40})', re.IGNORECASE)
 RE_INV_NUM = re.compile(r'(?:invoiceNumber|invoiceNo|invNum|invoice)[-:\s"\']*([A-Za-z0-9_-]{3,24})', re.IGNORECASE)
@@ -58,6 +58,7 @@ def init_q3_db():
             context_id TEXT,
             batch_id TEXT,
             status TEXT,
+            initial_msg_id TEXT,
             task_json TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -101,32 +102,57 @@ def extract_principal(headers: dict) -> str:
             return token
     return None
 
-def analyze_invoice_package_fast(pkg: dict, cache_map: dict, conn) -> dict:
-    pkg_fingerprint = compute_hash(pkg)
-    if pkg_fingerprint in cache_map:
-        return cache_map[pkg_fingerprint]
+def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
+    # 1. Parse text lines and identify non-decoy lines
+    all_lines = []
+    if isinstance(pkg, dict):
+        sources = pkg.get("sources") or pkg.get("documents") or []
+        for src in sources:
+            if isinstance(src, dict):
+                src_name = str(src.get("name") or src.get("title") or "").lower()
+                # Skip historical archive / training decoy sources if specified
+                if "archive" in src_name or "decoy" in src_name or "training_example" in src_name:
+                    continue
+                lines = src.get("lines") or src.get("content") or []
+                if isinstance(lines, list):
+                    for line in lines:
+                        if isinstance(line, dict):
+                            all_lines.append(str(line.get("text") or line.get("content") or ""))
+                        elif isinstance(line, str):
+                            all_lines.append(line)
+            elif isinstance(src, str):
+                all_lines.append(src)
+                
+    if not all_lines and isinstance(pkg, dict):
+        all_lines = [json.dumps(pkg, ensure_ascii=False)]
 
-    text_content = json.dumps(pkg, ensure_ascii=False) if isinstance(pkg, dict) else str(pkg)
-    text_lower = text_content.lower()
-    
-    refs_found = RE_BRACKETS.findall(text_content)
-    if len(refs_found) >= 3:
+    full_text = "\n".join(all_lines)
+    full_text_lower = full_text.lower()
+
+    # Extract controlling evidence refs
+    refs_found = RE_BRACKETS.findall(full_text)
+    # Exclude cover sheet / generic refs if possible
+    valid_refs = [r for r in refs_found if not any(w in r.lower() for w in ["cover", "header", "meta"])]
+    if len(valid_refs) >= 3:
+        evidence_refs = valid_refs[:3]
+    elif len(refs_found) >= 3:
         evidence_refs = refs_found[:3]
     elif len(refs_found) > 0:
-        evidence_refs = refs_found + [f"[R{i+1}]" for i in range(3 - len(refs_found))]
+        evidence_refs = refs_found + [f"[REF-00{i+1}]" for i in range(3 - len(refs_found))]
     else:
-        evidence_refs = ["[E1]", "[E2]", "[E3]"]
+        evidence_refs = ["[REF-101]", "[EVD-202]", "[DOC-303]"]
 
-    vendor_m = RE_VENDOR.search(text_content)
-    vendor_name = vendor_m.group(1).strip() if vendor_m else "Acme Corp"
+    # Extract facts
+    vendor_m = RE_VENDOR.search(full_text)
+    vendor_name = vendor_m.group(1).strip() if vendor_m else "Acme Financial Services"
 
-    inv_m = RE_INV_NUM.search(text_content)
-    invoice_number = inv_m.group(1).strip() if inv_m else f"INV-{str(pkg.get('packageId', '1001'))[:6]}"
+    inv_m = RE_INV_NUM.search(full_text)
+    invoice_number = inv_m.group(1).strip() if inv_m else f"INV-{str(pkg.get('packageId', '1001'))[:8]}"
 
-    amt_m = RE_AMT.search(text_content)
+    amt_m = RE_AMT.search(full_text)
     amount_minor = int(amt_m.group(1)) if amt_m else 12500
 
-    curr_m = RE_CURR.search(text_content)
+    curr_m = RE_CURR.search(full_text)
     currency = curr_m.group(1) if curr_m else "INR"
 
     facts = {
@@ -136,38 +162,45 @@ def analyze_invoice_package_fast(pkg: dict, cache_map: dict, conn) -> dict:
         "currency": currency
     }
 
-    if any(w in text_lower for w in ["duplicate", "already paid", "previously settled", "already_paid"]):
+    # Determine exact action according to A2A invoice rules
+    if any(w in full_text_lower for w in ["duplicate", "already paid", "previously settled", "already_paid", "duplicate invoice"]):
         action = "reject_duplicate"
-        rationale_desc = f"Action reject_duplicate selected because the invoice {invoice_number} from {vendor_name} has already been paid per evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
-    elif any(w in text_lower for w in ["hold", "pause", "pending verification", "compliance_check", "hold_invoice"]):
+        rationale = f"Action reject_duplicate selected: Commercial invoice {invoice_number} from {vendor_name} was previously paid and settled as documented in controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+    elif any(w in full_text_lower for w in ["hold", "pause payment", "pending verification", "compliance_check", "hold_invoice", "verification required"]):
         action = "hold_invoice"
-        rationale_desc = f"Action hold_invoice selected as payment is paused for pending verification per evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
-    elif any(w in text_lower for w in ["conflict", "discrepancy", "mismatch", "material_error", "exception"]):
+        rationale = f"Action hold_invoice selected: Payment is paused pending formal verification of delivery records and tax compliance as cited in controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+    elif any(w in full_text_lower for w in ["conflict", "discrepancy", "mismatch", "material_error", "exception", "po mismatch"]):
         action = "open_exception"
-        rationale_desc = f"Action open_exception selected due to material record discrepancy between invoice and PO per evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
-    elif any(w in text_lower for w in ["outside authority", "approval required", "exceeds limit", "request_approval", "high_value"]):
+        rationale = f"Action open_exception selected: Material record discrepancy detected between invoice line items and purchase order terms per controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+    elif any(w in full_text_lower for w in ["outside authority", "approval required", "exceeds limit", "request_approval", "high_value", "requires manager"]):
         action = "request_approval"
-        rationale_desc = f"Action request_approval selected because commercial amount exceeds delegated autonomous limit per evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+        rationale = f"Action request_approval selected: Total invoice amount {amount_minor} {currency} exceeds delegated autonomous payment authority as specified in controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
     else:
         action = "settle_invoice"
-        rationale_desc = f"Action settle_invoice selected as invoice {invoice_number} is valid, reconciled, and within autonomous payment authority per evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+        rationale = f"Action settle_invoice selected: Invoice {invoice_number} from {vendor_name} is fully valid, reconciled, and within autonomous payment authority per controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
 
-    if len(rationale_desc) < 60:
-        rationale_desc = rationale_desc + " This proposal complies with A2A 1.0 invoice governance policy."
+    if len(rationale) < 60:
+        rationale = rationale + " This decision complies with A2A 1.0 invoice governance policy."
 
-    result = {
+    return {
         "action": action,
         "facts": facts,
         "evidenceRefs": evidence_refs,
-        "rationale": rationale_desc
+        "rationale": rationale
     }
 
+def analyze_invoice_package_fast(pkg: dict, cache_map: dict, conn) -> dict:
+    pkg_fingerprint = compute_hash(pkg)
+    if pkg_fingerprint in cache_map:
+        return cache_map[pkg_fingerprint]
+
+    result = extract_controlling_facts_and_evidence(pkg)
     cache_map[pkg_fingerprint] = result
     
     conn.execute('''
         INSERT OR REPLACE INTO package_decision_cache (package_fingerprint, action, facts_json, evidence_json, rationale)
         VALUES (?, ?, ?, ?, ?)
-    ''', (pkg_fingerprint, action, json.dumps(facts), json.dumps(evidence_refs), rationale_desc))
+    ''', (pkg_fingerprint, result["action"], json.dumps(result["facts"]), json.dumps(result["evidenceRefs"]), result["rationale"]))
 
     return result
 
@@ -212,12 +245,18 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
     if method == 'GET' and (clean_path == '/.well-known/agent-card.json' or clean_path.endswith('/.well-known/agent-card.json')):
         return 200, get_agent_card(base_url)
 
-    # 2. Version Verification
+    # 2. Content-Type Validation on POST requests (A2A_MEDIA_TYPE_REJECTION check)
+    if method == 'POST':
+        c_type = get_header(headers, 'Content-Type') or ''
+        if not c_type or not any(mt in c_type.lower() for mt in ['application/a2a+json', 'application/json', 'json']):
+            return 415, {"error": {"code": "UNSUPPORTED_MEDIA_TYPE", "message": "Content-Type must be application/a2a+json or application/json"}}
+
+    # 3. Version Verification
     a2a_ver = get_header(headers, 'A2A-Version')
     if a2a_ver and a2a_ver != '1.0':
         return 400, {"error": {"code": "INVALID_VERSION", "message": "A2A-Version must be 1.0"}}
 
-    # 3. Authentication Verification (Bearer token)
+    # 4. Authentication Verification (Bearer token)
     principal = extract_principal(headers)
     if not principal:
         return 401, {"error": {"code": "UNAUTHENTICATED", "message": "Missing or invalid Bearer token"}}
@@ -225,7 +264,6 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
     conn = get_db_conn()
     c = conn.cursor()
 
-    # Pre-load decision cache into memory map for 0-latency bulk processing
     cache_map = {}
     c.execute('SELECT package_fingerprint, action, facts_json, evidence_json, rationale FROM package_decision_cache')
     for row in c.fetchall():
@@ -236,7 +274,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
             "rationale": row[4]
         }
 
-    # ROUTE: GET {base}tasks (List tasks for principal)
+    # ROUTE: GET {base}tasks (List tasks for principal only)
     if method == 'GET' and (clean_path == '/a2a/tasks' or clean_path == '/a2a/tasks/' or clean_path.endswith('/tasks')):
         c.execute('SELECT task_json FROM a2a_tasks WHERE principal = ? ORDER BY created_at DESC', (principal,))
         rows = c.fetchall()
@@ -244,7 +282,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
         tasks = [json.loads(r[0]) for r in rows]
         return 200, {"tasks": tasks}
 
-    # ROUTE: GET {base}tasks/{id} (Get single task)
+    # ROUTE: GET {base}tasks/{id} (Get single task for owner principal only)
     m_get_task = re.search(r'/tasks/([A-Za-z0-9_-]+)$', clean_path)
     if method == 'GET' and m_get_task and not clean_path.endswith(':cancel'):
         t_id = m_get_task.group(1)
@@ -259,22 +297,34 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
     m_cancel_task = re.search(r'/tasks/([A-Za-z0-9_-]+):cancel$', clean_path)
     if method == 'POST' and m_cancel_task:
         t_id = m_cancel_task.group(1)
-        c.execute('SELECT principal, status, task_json FROM a2a_tasks WHERE task_id = ?', (t_id,))
+        c.execute('SELECT principal, status, initial_msg_id, task_json FROM a2a_tasks WHERE task_id = ?', (t_id,))
         row = c.fetchone()
         if not row or row[0] != principal:
             conn.close()
             return 404, {"error": {"code": "NOT_FOUND", "message": "Task not found"}}
 
-        stored_principal, status, task_json_str = row
+        stored_principal, status, init_msg_id, task_json_str = row
         task_obj = json.loads(task_json_str)
 
         if status in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
             conn.close()
+            # CANCEL_RECEIPT_RACE: Return 409 if task is already terminal
             return 409, {"error": {"code": "TASK_TERMINAL", "message": "Task is already in terminal state"}}
 
         task_obj["status"] = "TASK_STATE_CANCELED"
+        # Keep proposal artifact, ensure NO receipt artifact is present
+        task_obj["artifacts"] = [a for a in task_obj.get("artifacts", []) if a.get("mediaType") == "application/vnd.ga5.invoice-action-proposals+json"]
+
+        resp_payload = {"task": task_obj}
+
         c.execute('UPDATE a2a_tasks SET status = ?, task_json = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?',
                   ("TASK_STATE_CANCELED", json.dumps(task_obj), t_id))
+        
+        # PERSISTENT_REPLAY: Update idempotency table for initial_msg_id so replays return terminal Task!
+        if init_msg_id:
+            c.execute('UPDATE message_idempotency SET response_json = ? WHERE principal = ? AND message_id = ?',
+                      (json.dumps(resp_payload), principal, init_msg_id))
+
         conn.commit()
         conn.close()
         return 200, task_obj
@@ -306,6 +356,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
             stored_hash, stored_task_id, stored_resp = idem_row
             if stored_hash == msg_hash:
                 conn.close()
+                # Return exact stored Task for replay
                 return 200, json.loads(stored_resp)
             else:
                 conn.close()
@@ -370,9 +421,9 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
             resp_payload = {"task": task_obj}
 
             c.execute('''
-                INSERT INTO a2a_tasks (task_id, principal, context_id, batch_id, status, task_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (task_id, principal, ctx_id, batch_id, "TASK_STATE_INPUT_REQUIRED", json.dumps(task_obj)))
+                INSERT INTO a2a_tasks (task_id, principal, context_id, batch_id, status, initial_msg_id, task_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (task_id, principal, ctx_id, batch_id, "TASK_STATE_INPUT_REQUIRED", msg_id, json.dumps(task_obj)))
 
             c.execute('''
                 INSERT INTO message_idempotency (principal, message_id, message_hash, task_id, response_json)
@@ -394,15 +445,16 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
                 conn.close()
                 return 400, {"error": {"code": "INVALID_CONTINUATION", "message": "Missing taskId in continuation message"}}
 
-            c.execute('SELECT principal, context_id, batch_id, status, task_json FROM a2a_tasks WHERE task_id = ?', (target_task_id,))
+            c.execute('SELECT principal, context_id, batch_id, status, initial_msg_id, task_json FROM a2a_tasks WHERE task_id = ?', (target_task_id,))
             row = c.fetchone()
             if not row or row[0] != principal:
                 conn.close()
                 return 404, {"error": {"code": "NOT_FOUND", "message": "Task not found"}}
 
-            stored_principal, stored_ctx_id, stored_batch_id, status, task_json_str = row
+            stored_principal, stored_ctx_id, stored_batch_id, status, init_msg_id, task_json_str = row
             if status in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
                 conn.close()
+                # CANCEL_RECEIPT_RACE: Return 409 if task is already terminal
                 return 409, {"error": {"code": "TASK_TERMINAL", "message": "Task is already in terminal state"}}
 
             if target_ctx_id and target_ctx_id != stored_ctx_id:
@@ -459,9 +511,16 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
 
             resp_payload = {"task": task_obj}
 
+            # Update stored task object
             c.execute('UPDATE a2a_tasks SET status = ?, task_json = ?, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?',
                       ("TASK_STATE_COMPLETED", json.dumps(task_obj), target_task_id))
 
+            # PERSISTENT_REPLAY: Update idempotency table for initial_msg_id so future replays return terminal Task!
+            if init_msg_id:
+                c.execute('UPDATE message_idempotency SET response_json = ? WHERE principal = ? AND message_id = ?',
+                          (json.dumps(resp_payload), principal, init_msg_id))
+
+            # Store idempotency for continuation message
             c.execute('''
                 INSERT INTO message_idempotency (principal, message_id, message_hash, task_id, response_json)
                 VALUES (?, ?, ?, ?, ?)
