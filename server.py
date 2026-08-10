@@ -12,8 +12,9 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-# Import Question 3 module
+# Import Question 3 & 4 modules
 import q3_invoice_agent
+import q4_incident_agent
 
 # ==========================================
 # QUESTION 1: AGENT GUARDRAIL (read_file / fetch_url)
@@ -526,7 +527,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
 
 
 # ==========================================
-# UNIFIED MULTI-QUESTION ROUTER (Q1, Q2 & Q3)
+# UNIFIED MULTI-QUESTION ROUTER (Q1, Q2, Q3 & Q4)
 # ==========================================
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -540,28 +541,41 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        # ROUTER STEP A: Question 3 A2A Protocol Routes (Agent Card, Tasks List, Task View)
-        if self.path == '/.well-known/agent-card.json' or self.path.startswith('/a2a') or '/tasks' in self.path:
+        # ROUTER STEP A: Question 4 Incident Agent Routes (/v2/incidents)
+        if self.path.startswith('/v2/incidents'):
+            headers_dict = {k: v for k, v in self.headers.items()}
+            code, resp_data = q4_incident_agent.handle_incident_route(self.path, 'GET', headers_dict, b'')
+            return self.reply(code, resp_data)
+
+        # ROUTER STEP B: Question 3 A2A Protocol Routes (Agent Card, Tasks List, Task View)
+        elif self.path == '/.well-known/agent-card.json' or self.path.startswith('/a2a') or '/tasks' in self.path:
             base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
             headers_dict = {k: v for k, v in self.headers.items()}
             code, resp_data = q3_invoice_agent.handle_a2a_route(self.path, 'GET', headers_dict, b'', base_url)
             media_type = 'application/a2a+json' if code == 200 else 'application/json; charset=utf-8'
             return self.reply(code, resp_data, media_type)
             
-        self.reply(200, {'ok': True, 'service': 'unified-q1-q2-q3-server'})
+        self.reply(200, {'ok': True, 'service': 'unified-q1-q2-q3-q4-server'})
 
     def do_POST(self):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             is_a2a_route = self.path.startswith('/a2a') or 'message:send' in self.path or '/tasks/' in self.path
+            is_q4_route = self.path.startswith('/v2/incidents')
             
-            if not is_a2a_route and (content_length <= 0 or content_length > 524288):
+            if not is_a2a_route and not is_q4_route and (content_length <= 0 or content_length > 786432):
                 return self.reply(400, {'action': 'block', 'reason': 'invalid content length', 'result': None})
 
             raw_body = self.rfile.read(content_length) if content_length > 0 else b''
 
-            # ROUTER STEP A: Question 3 A2A Protocol POST Routes (/a2a/message:send, /a2a/tasks/{id}:cancel)
-            if is_a2a_route:
+            # ROUTER STEP A: Question 4 AI Incident Response Agent Routes (/v2/incidents)
+            if is_q4_route:
+                headers_dict = {k: v for k, v in self.headers.items()}
+                code, resp_data = q4_incident_agent.handle_incident_route(self.path, 'POST', headers_dict, raw_body)
+                return self.reply(code, resp_data)
+
+            # ROUTER STEP B: Question 3 A2A Protocol POST Routes (/a2a/message:send, /a2a/tasks/{id}:cancel)
+            elif is_a2a_route:
                 base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
                 headers_dict = {k: v for k, v in self.headers.items()}
                 code, resp_data = q3_invoice_agent.handle_a2a_route(self.path, 'POST', headers_dict, raw_body, base_url)
@@ -573,7 +587,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 return self.reply(400, {'action': 'block', 'reason': 'malformed JSON payload', 'result': None})
 
-            # ROUTER STEP B: Question 1 Agent Guardrail (tool: read_file / fetch_url)
+            # ROUTER STEP C: Question 1 Agent Guardrail (tool: read_file / fetch_url)
             if isinstance(req, dict) and 'tool' in req:
                 tool = req.get('tool')
                 args = req.get('arguments')
@@ -589,7 +603,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else:
                     return self.reply(200, {'action': 'block', 'reason': 'unknown tool', 'result': None})
 
-            # ROUTER STEP C: Question 2 Mailroom Action Gate v2 (profile: ga5-mailroom-action-gate/v2)
+            # ROUTER STEP D: Question 2 Mailroom Action Gate v2 (profile: ga5-mailroom-action-gate/v2)
             elif isinstance(req, dict) and req.get('profile') == 'ga5-mailroom-action-gate/v2':
                 operation = req.get('operation')
                 if operation == 'propose':
@@ -599,7 +613,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else:
                     return self.reply(400, {'error': 'unknown or missing operation'})
 
-            # ROUTER STEP D: Fallback check for A2A payload structure if path was base path
+            # ROUTER STEP E: Question 4 Profile check fallback
+            elif isinstance(req, dict) and req.get('profile') == 'ga5-incident-agent/v2':
+                headers_dict = {k: v for k, v in self.headers.items()}
+                code, resp_data = q4_incident_agent.handle_incident_route('/v2/incidents', 'POST', headers_dict, raw_body)
+                return self.reply(code, resp_data)
+
+            # ROUTER STEP F: Question 3 Fallback check for A2A payload structure if path was base path
             elif isinstance(req, dict) and ('message' in req or 'parts' in req):
                 base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
                 headers_dict = {k: v for k, v in self.headers.items()}
@@ -819,6 +839,7 @@ if __name__ == '__main__':
     init_environment()
     init_db()
     q3_invoice_agent.init_q3_db()
+    q4_incident_agent.init_q4_db()
     port = int(os.environ.get('PORT', '10000'))
     server = ThreadingHTTPServer(('0.0.0.0', port), RequestHandler)
     print(f"Unified Multi-Question Server listening on port {port}...")
