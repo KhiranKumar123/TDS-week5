@@ -163,7 +163,7 @@ def validate_url(url_str: str):
         
     scheme = (parsed.scheme or '').lower()
     if scheme not in ('http', 'https'):
-        return False, 'only http and https schemes are allowed'
+        return False, 'only http and schemes are allowed'
         
     netloc = (parsed.netloc or '').lower()
     if not netloc or '@' in netloc or '\\' in netloc or '%40' in netloc or '%5c' in netloc:
@@ -361,41 +361,60 @@ def verify_receipt_signature(pubkey_jwk: dict, commit_eval_id: str, commit_input
 def generate_proposal_for_dossier(dossier: dict) -> dict:
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "support@company.com")
-    objective = (dossier.get("objective") or "").lower()
-
-    lines_info = []
-    for src in dossier.get("sources", []):
+    
+    sources = dossier.get("sources", [])
+    
+    internal_sources = []
+    external_sources = []
+    case_record_sources = []
+    
+    all_lines = []
+    
+    for src in sources:
         s_id = src.get("sourceId", "")
         prov = (src.get("provenance") or "external").lower()
         kind = (src.get("kind") or "email").lower()
-        is_internal = prov in ["internal", "system", "trusted", "case_management", "vault", "security"]
+        title = (src.get("title") or "").lower()
+        
+        is_internal = prov in ["internal", "system", "trusted", "case_management", "vault", "security"] or "internal" in prov
+        
+        src_info = {
+            "sourceId": s_id,
+            "provenance": prov,
+            "kind": kind,
+            "title": title,
+            "is_internal": is_internal,
+            "lines": []
+        }
         
         for l in src.get("lines", []):
             l_id = l.get("lineId")
             text = l.get("text", "")
             if l_id:
-                lines_info.append({
+                line_obj = {
                     "lineId": l_id,
                     "text": text,
                     "provenance": prov,
                     "kind": kind,
                     "sourceId": s_id,
                     "is_internal": is_internal
-                })
+                }
+                src_info["lines"].append(line_obj)
+                all_lines.append(line_obj)
+                
+        if is_internal:
+            internal_sources.append(src_info)
+        else:
+            external_sources.append(src_info)
+            
+        if kind == "case_record" or "case" in prov or "case" in title:
+            case_record_sources.append(src_info)
 
-    if not lines_info:
-        lines_info.append({"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1", "is_internal": False})
+    if not all_lines:
+        all_lines.append({"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1", "is_internal": False})
 
-    full_text = "\n".join([l["text"] for l in lines_info])
+    full_text = "\n".join([l["text"] for l in all_lines])
     full_text_lower = full_text.lower()
-
-    def find_matching_line_id(patterns):
-        for l in lines_info:
-            t_lower = l["text"].lower()
-            for p in patterns:
-                if p in t_lower:
-                    return l["lineId"]
-        return lines_info[0]["lineId"]
 
     def extract_exact_email(default_val="customer@example.com"):
         m1 = re.search(r'(?:From|To|Sender|Client|User|Email)[-:\s]*([\w\.-]+@[\w\.-]+\.\w+)', full_text, re.IGNORECASE)
@@ -419,14 +438,14 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         return default_val or f"REF-{dossier_id[:8]}"
 
     def extract_exact_event_id():
-        for l in lines_info:
+        for l in all_lines:
             m = re.search(r'\b(EVT|EVENT|LOG|SRC)[-:#\s]*([A-Za-z0-9_-]+)\b', l["text"], re.IGNORECASE)
             if m:
                 return f"{m.group(1).upper()}-{m.group(2)}"
-        return lines_info[0]["sourceId"]
+        return all_lines[0]["sourceId"]
 
-    # RULE 1: Quarantine Prompt Injections / Security Risks
-    INJECTION_KEYWORDS = [
+    # 1. SECURITY THREAT (Quarantine Item from untrusted external sources)
+    ATTACK_PATTERNS = [
         "ignore previous instructions", "ignore all prior", "disregard previous",
         "system override", "secret canary", "canary:", "admin prompt", "print api key",
         "leak vault", "unauthorized outbound", "override system", "tool control",
@@ -434,10 +453,10 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         "developer mode", "bypass safety", "send email to", "transfer funds", "leak secret"
     ]
 
-    for l in lines_info:
-        if not l["is_internal"]:
+    for src in external_sources:
+        for l in src["lines"]:
             t_lower = l["text"].lower()
-            if any(kw in t_lower for kw in INJECTION_KEYWORDS):
+            if any(att in t_lower for att in ATTACK_PATTERNS):
                 return {
                     "dossierId": dossier_id,
                     "action": "quarantine_item",
@@ -449,9 +468,16 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                     "evidence": [l["lineId"]]
                 }
 
-    # RULE 2: Update Internal Record (Delivery Window Change)
-    if "delivery" in full_text_lower or "delivery_window" in full_text_lower or "case_record" in full_text_lower or "reschedule" in full_text_lower:
-        case_line_id = find_matching_line_id(["case", "delivery", "window", "reschedule", "event"])
+    # 2. INTERNAL CASE RECORD UPDATE (update_internal_record)
+    if case_record_sources or any("delivery" in l["text"].lower() or "reschedule" in l["text"].lower() for l in all_lines if l["is_internal"]):
+        case_line = None
+        for l in all_lines:
+            if l["is_internal"] and any(w in l["text"].lower() for w in ["delivery", "reschedule", "window", "case"]):
+                case_line = l
+                break
+        if not case_line:
+            case_line = all_lines[0]
+            
         case_ref = extract_exact_ref(f"CASE-{dossier_id[:6]}")
         event_ref = extract_exact_event_id()
         val = "MORNING"
@@ -469,48 +495,49 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                 "sourceEventId": event_ref,
                 "value": val
             },
-            "evidence": [case_line_id]
+            "evidence": [case_line["lineId"]]
         }
 
-    # RULE 3: Send Approved Notice (Outbound Send ONLY with Explicit Approval)
-    if "approved" in full_text_lower or "approved_delivery_notice" in full_text_lower or "approved notice" in full_text_lower:
-        appr_line_id = find_matching_line_id(["approved", "notice", "email", "send"])
-        recip_email = extract_exact_email("customer@example.com")
-        ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
-        
-        return {
-            "dossierId": dossier_id,
-            "action": "send_approved_notice",
-            "target": {"kind": "email", "id": recip_email},
-            "payload": {
-                "referenceId": ref_id,
-                "status": "APPROVED",
-                "template": "approved_delivery_notice"
-            },
-            "evidence": [appr_line_id]
-        }
+    # 3. INTERNAL OUTBOUND SEND APPROVAL (send_approved_notice)
+    for src in internal_sources:
+        for l in src["lines"]:
+            t_lower = l["text"].lower()
+            if any(w in t_lower for w in ["approved", "authorized", "approved_notice", "notice_authorized", "send_approved"]):
+                recip_email = extract_exact_email("customer@example.com")
+                ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
+                return {
+                    "dossierId": dossier_id,
+                    "action": "send_approved_notice",
+                    "target": {"kind": "email", "id": recip_email},
+                    "payload": {
+                        "referenceId": ref_id,
+                        "status": "APPROVED",
+                        "template": "approved_delivery_notice"
+                    },
+                    "evidence": [l["lineId"]]
+                }
 
-    # RULE 4: Request Confirmation (Unverified / Ambiguous / Identity Conflict)
-    if "unverified" in full_text_lower or "conflict" in full_text_lower or "ambiguous" in full_text_lower or "mismatch" in full_text_lower or "verify" in full_text_lower:
-        conf_line_id = find_matching_line_id(["unverified", "sender", "conflict", "verify", "mismatch"])
-        claimed_sender = extract_exact_email("sender@example.com")
-        ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
-        
-        return {
-            "dossierId": dossier_id,
-            "action": "request_confirmation",
-            "target": {"kind": "approval_queue", "id": "tier2_support"},
-            "payload": {
-                "claimedSender": claimed_sender,
-                "questionCode": "VERIFY_REQUEST",
-                "referenceId": ref_id
-            },
-            "evidence": [conf_line_id]
-        }
+    # 4. UNVERIFIED IDENTITY / CONFIRMATION REQUIRED (request_confirmation)
+    for l in all_lines:
+        t_lower = l["text"].lower()
+        if any(w in t_lower for w in ["unverified", "identity_conflict", "verify_sender", "mismatch", "unauthorized_sender"]):
+            claimed_sender = extract_exact_email("sender@example.com")
+            ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
+            return {
+                "dossierId": dossier_id,
+                "action": "request_confirmation",
+                "target": {"kind": "approval_queue", "id": "tier2_support"},
+                "payload": {
+                    "claimedSender": claimed_sender,
+                    "questionCode": "VERIFY_REQUEST",
+                    "referenceId": ref_id
+                },
+                "evidence": [l["lineId"]]
+            }
 
-    # RULE 5: Create Draft (Customer Inquiry / Order Status)
-    if "draft" in full_text_lower or "inquiry" in full_text_lower or "status" in full_text_lower or "order" in full_text_lower:
-        draft_line_id = find_matching_line_id(["draft", "inquiry", "order", "status", "from"])
+    # 5. EXTERNAL INQUIRY FOR DRAFT CREATION (create_draft)
+    if external_sources:
+        inquiry_line = external_sources[0]["lines"][0] if external_sources[0]["lines"] else all_lines[0]
         recip_email = extract_exact_email("customer@example.com")
         ref_id = extract_exact_ref(f"ORD-{dossier_id[:6]}")
         
@@ -524,19 +551,18 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
                 "status": "DRAFT_PENDING",
                 "template": "order_status"
             },
-            "evidence": [draft_line_id]
+            "evidence": [inquiry_line["lineId"]]
         }
 
-    # RULE 6: Default / No Action (Duplicate / Completed / Informational)
-    first_line_id = lines_info[0]["lineId"] if lines_info else "L1"
+    # 6. DEFAULT / NO ACTION (no_action)
+    first_line_id = all_lines[0]["lineId"]
     ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
-    
     reason = "INFORMATIONAL"
     if "duplicate" in full_text_lower:
         reason = "DUPLICATE"
     elif "completed" in full_text_lower or "done" in full_text_lower:
         reason = "ALREADY_COMPLETED"
-        
+
     return {
         "dossierId": dossier_id,
         "action": "no_action",
