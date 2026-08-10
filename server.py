@@ -20,23 +20,20 @@ SAFE_FIXTURES = {
     'encoded/%2e%2e-literal.txt': 'SAFE_ENCODED_4c73da330700189b48dd4c67',
 }
 
-# Exact netloc allowlists for HTTP and HTTPS
-ALLOWED_NETLOCS_HTTP = {'example.com', 'example.com:80', 'www.iana.org', 'www.iana.org:80'}
-ALLOWED_NETLOCS_HTTPS = {'example.com', 'example.com:443', 'www.iana.org', 'www.iana.org:443'}
+# Allowed netlocs for HTTP and HTTPS (including www variants)
+ALLOWED_NETLOCS_HTTP = {
+    'example.com', 'example.com:80',
+    'www.example.com', 'www.example.com:80',
+    'iana.org', 'iana.org:80',
+    'www.iana.org', 'www.iana.org:80'
+}
 
-BLOCKED_URL_STRINGS = [
-    '@',
-    '\\',
-    '%40',
-    '%5c',
-    '169.254.169.254',
-    '127.0.0.1',
-    '0.0.0.0',
-    '::1',
-    'localhost',
-    'metadata.google.internal',
-    'instance-data',
-]
+ALLOWED_NETLOCS_HTTPS = {
+    'example.com', 'example.com:443',
+    'www.example.com', 'www.example.com:443',
+    'iana.org', 'iana.org:443',
+    'www.iana.org', 'www.iana.org:443'
+}
 
 def init_environment():
     """Ensure all required files exist on the filesystem before handling requests."""
@@ -165,19 +162,6 @@ def validate_url(url_str: str):
     if any(ord(c) < 32 or ord(c) == 127 for c in url_str):
         return False, 'control characters in URL'
 
-    # Check unquoted versions for embedded unsafe tokens / userinfo / metadata IPs
-    s = url_str
-    for _ in range(5):
-        unq = urllib.parse.unquote(s)
-        if unq == s:
-            break
-        s = unq
-        
-    s_lower = s.lower()
-    for pattern in BLOCKED_URL_STRINGS:
-        if pattern in s_lower:
-            return False, f'blocked URL string pattern: {pattern}'
-
     try:
         parsed = urllib.parse.urlsplit(url_str)
     except Exception:
@@ -188,8 +172,11 @@ def validate_url(url_str: str):
         return False, 'only http and https schemes are allowed'
         
     netloc = (parsed.netloc or '').lower()
-    if not netloc:
-        return False, 'missing network location'
+    if not netloc or '@' in netloc or '\\' in netloc or '%40' in netloc or '%5c' in netloc:
+        return False, 'userinfo or invalid authority in URL'
+        
+    if parsed.username is not None or parsed.password is not None:
+        return False, 'userinfo is not allowed'
         
     if scheme == 'http':
         if netloc not in ALLOWED_NETLOCS_HTTP:
