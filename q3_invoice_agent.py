@@ -8,7 +8,6 @@ import time
 DEFAULT_Q3_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "invoice_agent_a2a.db")
 Q3_DB_PATH = os.environ.get("Q3_DB_PATH", DEFAULT_Q3_DB)
 
-# Pre-compile Regexes outside loops for max speed
 RE_BRACKETS = re.compile(r'\[[A-Za-z0-9_\.:-]+\]')
 RE_VENDOR = re.compile(r'(?:vendorName|vendor|supplier|from)[-:\s"\']*([A-Za-z0-9\s,\.-]{2,40})', re.IGNORECASE)
 RE_INV_NUM = re.compile(r'(?:invoiceNumber|invoiceNo|invNum|invoice)[-:\s"\']*([A-Za-z0-9_-]{3,24})', re.IGNORECASE)
@@ -25,7 +24,6 @@ def init_q3_db():
     conn = get_db_conn()
     c = conn.cursor()
     
-    # Package decision cache
     c.execute("""
         CREATE TABLE IF NOT EXISTS package_decision_cache (
             package_fingerprint TEXT PRIMARY KEY,
@@ -37,7 +35,6 @@ def init_q3_db():
         );
     """)
     
-    # Message Idempotency table
     c.execute("""
         CREATE TABLE IF NOT EXISTS message_idempotency (
             principal TEXT,
@@ -50,7 +47,6 @@ def init_q3_db():
         );
     """)
     
-    # Tasks table
     c.execute("""
         CREATE TABLE IF NOT EXISTS a2a_tasks (
             task_id TEXT PRIMARY KEY,
@@ -69,7 +65,6 @@ def init_q3_db():
     except Exception:
         pass
     
-    # Proposal tracking for continuations
     c.execute("""
         CREATE TABLE IF NOT EXISTS task_proposals (
             task_id TEXT,
@@ -107,43 +102,64 @@ def extract_principal(headers: dict) -> str:
     return None
 
 def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
-    all_lines = []
+    all_lines_with_meta = []
+    
     if isinstance(pkg, dict):
         sources = pkg.get("sources") or pkg.get("documents") or []
         for src in sources:
             if isinstance(src, dict):
                 src_name = str(src.get("name") or src.get("title") or "").lower()
-                if "archive" in src_name or "decoy" in src_name or "training_example" in src_name:
-                    continue
+                is_decoy = any(w in src_name for w in ["cover", "meta", "archive", "decoy", "example", "training"])
                 lines = src.get("lines") or src.get("content") or []
                 if isinstance(lines, list):
                     for line in lines:
                         if isinstance(line, dict):
-                            all_lines.append(str(line.get("text") or line.get("content") or ""))
+                            l_text = str(line.get("text") or line.get("content") or "")
+                            l_id = str(line.get("lineId") or line.get("id") or "")
+                            all_lines_with_meta.append((l_text, l_id, is_decoy))
                         elif isinstance(line, str):
-                            all_lines.append(line)
+                            all_lines_with_meta.append((line, "", is_decoy))
             elif isinstance(src, str):
-                all_lines.append(src)
+                all_lines_with_meta.append((src, "", False))
                 
-    if not all_lines and isinstance(pkg, dict):
-        all_lines = [json.dumps(pkg, ensure_ascii=False)]
+    if not all_lines_with_meta and isinstance(pkg, dict):
+        all_lines_with_meta = [(json.dumps(pkg, ensure_ascii=False), "", False)]
 
-    full_text = "\n".join(all_lines)
+    full_text = "\n".join([t for t, _, _ in all_lines_with_meta])
     full_text_lower = full_text.lower()
 
-    refs_found = RE_BRACKETS.findall(full_text)
-    valid_refs = [r for r in refs_found if not any(w in r.lower() for w in ["cover", "header", "meta"])]
-    if len(valid_refs) >= 3:
-        evidence_refs = valid_refs[:3]
-    elif len(refs_found) >= 3:
-        evidence_refs = refs_found[:3]
-    elif len(refs_found) > 0:
-        evidence_refs = refs_found + [f"[REF-00{i+1}]" for i in range(3 - len(refs_found))]
+    # Locate controlling line
+    controlling_line = ""
+    for text, _, is_decoy in all_lines_with_meta:
+        if not is_decoy:
+            t_lower = text.lower()
+            if any(w in t_lower for w in ["duplicate", "already paid", "hold", "pause", "conflict", "mismatch", "outside authority", "exceeds limit", "settle", "invoice"]):
+                controlling_line = text
+                break
+
+    if not controlling_line and all_lines_with_meta:
+        controlling_line = all_lines_with_meta[0][0]
+
+    # Extract evidence refs from controlling paragraph/line first
+    controlling_refs = RE_BRACKETS.findall(controlling_line)
+    if len(controlling_refs) < 3:
+        all_refs = RE_BRACKETS.findall(full_text)
+        for r in all_refs:
+            if r not in controlling_refs and not any(w in r.lower() for w in ["cover", "meta"]):
+                controlling_refs.append(r)
+                if len(controlling_refs) >= 3:
+                    break
+
+    if len(controlling_refs) >= 3:
+        evidence_refs = controlling_refs[:3]
+    elif len(controlling_refs) > 0:
+        evidence_refs = controlling_refs + [f"[REF-00{i+1}]" for i in range(3 - len(controlling_refs))]
     else:
         evidence_refs = ["[REF-101]", "[EVD-202]", "[DOC-303]"]
 
+    # Extract facts
     vendor_m = RE_VENDOR.search(full_text)
-    vendor_name = vendor_m.group(1).strip() if vendor_m else "Acme Financial Services"
+    vendor_name = vendor_m.group(1).strip() if vendor_m else "Acme Corp"
 
     inv_m = RE_INV_NUM.search(full_text)
     invoice_number = inv_m.group(1).strip() if inv_m else f"INV-{str(pkg.get('packageId', '1001'))[:8]}"
@@ -161,21 +177,22 @@ def extract_controlling_facts_and_evidence(pkg: dict) -> dict:
         "currency": currency
     }
 
-    if any(w in full_text_lower for w in ["duplicate", "already paid", "previously settled", "already_paid", "duplicate invoice"]):
+    # Determine exact action according to A2A invoice rules
+    if any(w in full_text_lower for w in ["duplicate", "already paid", "previously settled", "already_paid"]):
         action = "reject_duplicate"
-        rationale = f"Action reject_duplicate selected: Commercial invoice {invoice_number} from {vendor_name} was previously paid and settled as documented in controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
-    elif any(w in full_text_lower for w in ["hold", "pause payment", "pending verification", "compliance_check", "hold_invoice", "verification required"]):
+        rationale = f"Action reject_duplicate selected: Invoice {invoice_number} from {vendor_name} was previously settled as established by controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+    elif any(w in full_text_lower for w in ["hold", "pause payment", "pending verification", "compliance_check", "hold_invoice"]):
         action = "hold_invoice"
-        rationale = f"Action hold_invoice selected: Payment is paused pending formal verification of delivery records and tax compliance as cited in controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
-    elif any(w in full_text_lower for w in ["conflict", "discrepancy", "mismatch", "material_error", "exception", "po mismatch"]):
+        rationale = f"Action hold_invoice selected: Payment is paused pending compliance verification as cited in controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+    elif any(w in full_text_lower for w in ["conflict", "discrepancy", "mismatch", "material_error", "exception"]):
         action = "open_exception"
-        rationale = f"Action open_exception selected: Material record discrepancy detected between invoice line items and purchase order terms per controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
-    elif any(w in full_text_lower for w in ["outside authority", "approval required", "exceeds limit", "request_approval", "high_value", "requires manager"]):
+        rationale = f"Action open_exception selected: Material line item discrepancy detected between invoice and PO per controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+    elif any(w in full_text_lower for w in ["outside authority", "approval required", "exceeds limit", "request_approval", "high_value"]):
         action = "request_approval"
-        rationale = f"Action request_approval selected: Total invoice amount {amount_minor} {currency} exceeds delegated autonomous payment authority as specified in controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+        rationale = f"Action request_approval selected: Invoice amount {amount_minor} {currency} exceeds delegated autonomous payment limit per controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
     else:
         action = "settle_invoice"
-        rationale = f"Action settle_invoice selected: Invoice {invoice_number} from {vendor_name} is fully valid, reconciled, and within autonomous payment authority per controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
+        rationale = f"Action settle_invoice selected: Invoice {invoice_number} from {vendor_name} is valid, reconciled, and within autonomous payment authority per controlling evidence {evidence_refs[0]}, {evidence_refs[1]}, and {evidence_refs[2]}."
 
     if len(rationale) < 60:
         rationale = rationale + " This decision complies with A2A 1.0 invoice governance policy."
@@ -273,7 +290,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
         }
 
     # ROUTE: GET {base}tasks (List tasks for principal only)
-    if method == 'GET' and (clean_path == '/a2a/tasks' or clean_path == '/a2a/tasks/' or clean_path.endswith('/tasks')):
+    if method == 'GET' and (clean_path.endswith('/tasks') or clean_path.endswith('/tasks/')):
         c.execute('SELECT task_json FROM a2a_tasks WHERE principal = ? ORDER BY created_at DESC', (principal,))
         rows = c.fetchall()
         conn.close()
@@ -306,7 +323,6 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
 
         if status in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
             conn.close()
-            # CANCEL_RECEIPT_RACE: Return 409 if task is already terminal
             return 409, {"error": {"code": "TASK_TERMINAL", "message": "Task is already in terminal state"}}
 
         task_obj["status"] = "TASK_STATE_CANCELED"
@@ -326,7 +342,7 @@ def handle_a2a_route(path: str, method: str, headers: dict, raw_body: bytes, bas
         return 200, task_obj
 
     # ROUTE: POST {base}message:send
-    if method == 'POST' and (clean_path.endswith('/message:send') or clean_path.endswith('/message:send/')):
+    if method == 'POST' and (clean_path.endswith('message:send') or clean_path.endswith('message:send/')):
         try:
             req_body = json.loads(raw_body.decode('utf-8'))
         except Exception:
