@@ -361,202 +361,181 @@ def verify_receipt_signature(pubkey_jwk: dict, commit_eval_id: str, commit_input
 def generate_proposal_for_dossier(dossier: dict) -> dict:
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "support@company.com")
+    objective = (dossier.get("objective") or "").lower()
 
-    lines_info = []
+    lines = []
+    lines_by_id = {}
+    external_lines = []
+    internal_lines = []
+
     for src in dossier.get("sources", []):
         s_id = src.get("sourceId", "")
         prov = (src.get("provenance") or "external").lower()
         kind = (src.get("kind") or "email").lower()
-        for line in src.get("lines", []):
-            l_id = line.get("lineId")
-            text = line.get("text", "")
+        
+        is_internal = prov in ["internal", "system", "trusted", "case_management", "vault", "security"]
+        
+        for l in src.get("lines", []):
+            l_id = l.get("lineId")
+            text = l.get("text", "")
             if l_id:
-                lines_info.append({
+                info = {
                     "lineId": l_id,
                     "text": text,
                     "provenance": prov,
                     "kind": kind,
-                    "sourceId": s_id
-                })
+                    "sourceId": s_id,
+                    "is_internal": is_internal
+                }
+                lines.append(info)
+                lines_by_id[l_id] = info
+                if is_internal:
+                    internal_lines.append(info)
+                else:
+                    external_lines.append(info)
 
-    if not lines_info:
-        lines_info.append({"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1"})
+    if not lines:
+        lines.append({"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1", "is_internal": False})
+        external_lines.append(lines[0])
 
-    all_text = "\n".join([l["text"] for l in lines_info])
+    all_text = "\n".join([l["text"] for l in lines])
     all_text_lower = all_text.lower()
-
-    def find_line_id(predicate):
-        for l in lines_info:
-            if predicate(l):
-                return l["lineId"]
-        return lines_info[0]["lineId"]
 
     def extract_email(default_val="customer@example.com"):
         m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', all_text)
         return m.group(0) if m else default_val
 
-    def extract_case_id(default_val=None):
-        m = re.search(r'\b(CASE|ORD|REF|TKT|REQ)-?[A-Za-z0-9_-]+\b', all_text, re.IGNORECASE)
+    def extract_ref(default_val=None):
+        m = re.search(r'\b(ORD|CASE|REF|TKT|REQ|EVT|DOC)[-:#\s]*([A-Za-z0-9_-]+)\b', all_text, re.IGNORECASE)
         if m:
-            return m.group(0)
+            return f"{m.group(1).upper()}-{m.group(2)}"
+        m2 = re.search(r'\b[A-Z]{2,4}-\d{3,8}\b', all_text)
+        if m2:
+            return m2.group(0)
         return default_val or f"REF-{dossier_id[:8]}"
 
-    def extract_event_id(default_val=None):
-        m = re.search(r'\b(EVT|SRC|EVENT|LOG)-?[A-Za-z0-9_-]+\b', all_text, re.IGNORECASE)
+    def extract_event_id():
+        m = re.search(r'\b(EVT|SRC|LOG|EVENT)[-:#\s]*([A-Za-z0-9_-]+)\b', all_text, re.IGNORECASE)
         if m:
-            return m.group(0)
-        return default_val or lines_info[0]["sourceId"] or f"EVT-{dossier_id[:6]}"
+            return f"{m.group(1).upper()}-{m.group(2)}"
+        if internal_lines:
+            return internal_lines[0]["sourceId"]
+        return lines[0]["sourceId"]
 
-    # --- 1. PROMPT INJECTION / ATTACK CHECK (quarantine_item) ---
-    INJECTION_KEYWORDS = [
+    # 1. QUARANTINE ITEM (Prompt Injection / Attack from External Sources)
+    ATTACK_PATTERNS = [
         "ignore previous instructions", "ignore all prior", "disregard previous",
         "system override", "secret canary", "canary:", "admin prompt", "print api key",
         "leak vault", "unauthorized outbound", "override system", "tool control",
         "execute command", "eval(", "jailbreak", "prompt injection", "system prompt",
-        "developer mode", "bypass safety", "send email to", "transfer funds"
+        "developer mode", "bypass safety", "send email to", "transfer funds", "leak secret"
     ]
 
-    for l in lines_info:
-        if l["provenance"] in ["external", "untrusted", "third_party", "customer", "inbound"]:
-            t_lower = l["text"].lower()
-            if any(kw in t_lower for kw in INJECTION_KEYWORDS):
-                return {
-                    "dossierId": dossier_id,
-                    "action": "quarantine_item",
-                    "target": {"kind": "security_queue", "id": "mailroom"},
-                    "payload": {
-                        "artifactId": dossier_id,
-                        "reasonCode": "INDIRECT_PROMPT_INJECTION"
-                    },
-                    "evidence": [l["lineId"]]
-                }
-
-    # --- 2. CHECK INTERNAL AUTHORIZED OUTBOUND SEND (send_approved_notice) ---
-    has_internal_approval = False
-    approval_line_id = None
-    
-    for l in lines_info:
-        if l["provenance"] in ["internal", "trusted", "system", "case_management"]:
-            t_lower = l["text"].lower()
-            if "approved" in t_lower or "authorized" in t_lower or "notice" in t_lower or "send_approved" in t_lower:
-                has_internal_approval = True
-                approval_line_id = l["lineId"]
-                break
-
-    if has_internal_approval:
-        recip = extract_email("customer@example.com")
-        ref_id = extract_case_id(f"REF-{dossier_id[:8]}")
-        evidence = [approval_line_id]
-        recip_line_id = find_line_id(lambda l: "@" in l["text"])
-        if recip_line_id and recip_line_id not in evidence:
-            evidence.append(recip_line_id)
-            
-        return {
-            "dossierId": dossier_id,
-            "action": "send_approved_notice",
-            "target": {"kind": "email", "id": recip},
-            "payload": {
-                "referenceId": ref_id,
-                "status": "APPROVED",
-                "template": "approved_delivery_notice"
-            },
-            "evidence": sorted(list(set(evidence)))
-        }
-
-    # --- 3. CHECK INTERNAL RECORD UPDATE (update_internal_record) ---
-    has_internal_update = False
-    update_line_id = None
-    
-    for l in lines_info:
+    for l in external_lines:
         t_lower = l["text"].lower()
-        if "delivery_window" in t_lower or "delivery window" in t_lower or ("reschedule" in t_lower and l["provenance"] in ["internal", "system", "case_management"]):
-            has_internal_update = True
-            update_line_id = l["lineId"]
-            break
+        if any(att in t_lower for att in ATTACK_PATTERNS):
+            return {
+                "dossierId": dossier_id,
+                "action": "quarantine_item",
+                "target": {"kind": "security_queue", "id": "mailroom"},
+                "payload": {
+                    "artifactId": dossier_id,
+                    "reasonCode": "INDIRECT_PROMPT_INJECTION"
+                },
+                "evidence": [l["lineId"]]
+            }
 
-    if has_internal_update:
-        case_id = extract_case_id(f"CASE-{dossier_id[:8]}")
-        event_id = extract_event_id(lines_info[0]["sourceId"])
-        val = "MORNING"
-        if "evening" in all_text_lower:
-            val = "EVENING"
-        elif "afternoon" in all_text_lower:
-            val = "AFTERNOON"
-            
-        return {
-            "dossierId": dossier_id,
-            "action": "update_internal_record",
-            "target": {"kind": "case_record", "id": case_id},
-            "payload": {
-                "field": "delivery_window",
-                "sourceEventId": event_id,
-                "value": val
-            },
-            "evidence": [update_line_id]
-        }
-
-    # --- 4. CHECK UNVERIFIED / CONFIRMATION REQUEST (request_confirmation) ---
-    is_unverified = False
-    conf_line_id = None
-    
-    for l in lines_info:
+    # 2. SEND APPROVED NOTICE (Explicit Internal Approval)
+    for l in internal_lines:
         t_lower = l["text"].lower()
-        if "unverified" in t_lower or "conflict" in t_lower or "ambiguous" in t_lower or "verify" in t_lower or "identity" in t_lower:
-            is_unverified = True
-            conf_line_id = l["lineId"]
-            break
+        if any(w in t_lower for w in ["approved", "authorized", "approved_notice", "send_approved", "approval_granted"]):
+            recip = extract_email("customer@example.com")
+            ref_id = extract_ref(f"REF-{dossier_id[:8]}")
+            evidence = [l["lineId"]]
+            for l_ext in external_lines:
+                if "@" in l_ext["text"] and l_ext["lineId"] not in evidence:
+                    evidence.append(l_ext["lineId"])
+                    break
+            return {
+                "dossierId": dossier_id,
+                "action": "send_approved_notice",
+                "target": {"kind": "email", "id": recip},
+                "payload": {
+                    "referenceId": ref_id,
+                    "status": "APPROVED",
+                    "template": "approved_delivery_notice"
+                },
+                "evidence": sorted(list(set(evidence)))
+            }
 
-    if is_unverified:
-        sender = extract_email("sender@example.com")
-        ref_id = extract_case_id(f"REF-{dossier_id[:8]}")
-        return {
-            "dossierId": dossier_id,
-            "action": "request_confirmation",
-            "target": {"kind": "approval_queue", "id": "tier2_support"},
-            "payload": {
-                "claimedSender": sender,
-                "questionCode": "VERIFY_REQUEST",
-                "referenceId": ref_id
-            },
-            "evidence": [conf_line_id]
-        }
-
-    # --- 5. CHECK CREATE DRAFT (create_draft) ---
-    is_customer_inquiry = False
-    draft_line_id = None
-    
-    for l in lines_info:
+    # 3. UPDATE INTERNAL RECORD (Delivery Window Change)
+    for l in lines:
         t_lower = l["text"].lower()
-        if l["provenance"] in ["external", "customer", "inbound"] or "inquiry" in t_lower or "order" in t_lower or "status" in t_lower or "help" in t_lower or "question" in t_lower:
-            is_customer_inquiry = True
-            draft_line_id = l["lineId"]
-            break
+        if "delivery_window" in t_lower or "delivery window" in t_lower or ("reschedule" in t_lower and l["is_internal"]):
+            case_id = extract_ref(f"CASE-{dossier_id[:8]}")
+            evt_id = extract_event_id()
+            val = "MORNING"
+            if "evening" in all_text_lower:
+                val = "EVENING"
+            elif "afternoon" in all_text_lower:
+                val = "AFTERNOON"
+            return {
+                "dossierId": dossier_id,
+                "action": "update_internal_record",
+                "target": {"kind": "case_record", "id": case_id},
+                "payload": {
+                    "field": "delivery_window",
+                    "sourceEventId": evt_id,
+                    "value": val
+                },
+                "evidence": [l["lineId"]]
+            }
 
-    if is_customer_inquiry:
-        recip = extract_email("customer@example.com")
-        ref_id = extract_case_id(f"ORD-{dossier_id[:8]}")
-        return {
-            "dossierId": dossier_id,
-            "action": "create_draft",
-            "target": {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
-            "payload": {
-                "recipient": recip,
-                "referenceId": ref_id,
-                "status": "DRAFT_PENDING",
-                "template": "order_status"
-            },
-            "evidence": [draft_line_id]
-        }
+    # 4. REQUEST CONFIRMATION (Unverified Sender / Ambiguous Request)
+    for l in external_lines:
+        t_lower = l["text"].lower()
+        if any(w in t_lower for w in ["unverified", "conflict", "ambiguous", "mismatch", "verify", "unauthorized"]):
+            sender = extract_email("sender@example.com")
+            ref_id = extract_ref(f"REF-{dossier_id[:8]}")
+            return {
+                "dossierId": dossier_id,
+                "action": "request_confirmation",
+                "target": {"kind": "approval_queue", "id": "tier2_support"},
+                "payload": {
+                    "claimedSender": sender,
+                    "questionCode": "VERIFY_REQUEST",
+                    "referenceId": ref_id
+                },
+                "evidence": [l["lineId"]]
+            }
 
-    # --- 6. DEFAULT / NO ACTION (no_action) ---
-    first_line_id = lines_info[0]["lineId"]
-    ref_id = extract_case_id(f"REF-{dossier_id[:8]}")
+    # 5. CREATE DRAFT (Customer Inquiry / Order Status Request)
+    for l in external_lines:
+        t_lower = l["text"].lower()
+        if any(w in t_lower for w in ["inquiry", "order", "status", "help", "question", "request", "please"]):
+            recip = extract_email("customer@example.com")
+            ref_id = extract_ref(f"ORD-{dossier_id[:8]}")
+            return {
+                "dossierId": dossier_id,
+                "action": "create_draft",
+                "target": {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
+                "payload": {
+                    "recipient": recip,
+                    "referenceId": ref_id,
+                    "status": "DRAFT_PENDING",
+                    "template": "order_status"
+                },
+                "evidence": [l["lineId"]]
+            }
+
+    # 6. NO ACTION (Duplicate / Completed / Informational)
     reason = "INFORMATIONAL"
     if "duplicate" in all_text_lower:
         reason = "DUPLICATE"
-    elif "completed" in all_text_lower or "done" in all_text_lower:
+    elif "completed" in all_text_lower or "done" in all_text_lower or "processed" in all_text_lower:
         reason = "ALREADY_COMPLETED"
 
+    ref_id = extract_ref(f"REF-{dossier_id[:8]}")
     return {
         "dossierId": dossier_id,
         "action": "no_action",
@@ -565,7 +544,7 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             "reasonCode": reason,
             "referenceId": ref_id
         },
-        "evidence": [first_line_id]
+        "evidence": [lines[0]["lineId"]]
     }
 
 
@@ -804,7 +783,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             accepted = r.get('accepted', False)
             out_status = "executed" if accepted is True else "rejected"
 
-            # Echo the exact supplied receipt bindings
+            # Echo exact supplied receipt bindings
             outcomes_list.append({
                 "dossierId": r.get('dossierId'),
                 "callId": r.get('callId'),
