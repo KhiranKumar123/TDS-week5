@@ -657,11 +657,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if row:
             stored_digest, stored_req_hash, stored_response_json = row[0], row[1], row[2]
             conn.close()
-            # If the raw body matches stored request hash, exact replay
             if stored_req_hash == request_hash and stored_response_json:
                 return self.reply(200, json.loads(stored_response_json))
             else:
-                # Any change in content for same evaluationId MUST return HTTP 409 Conflict
                 return self.reply(409, {'error': 'changed content conflict for same evaluationId'})
 
         jwk_json = json.dumps(verifier['publicKeyJwk'])
@@ -753,13 +751,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self.reply(400, {'error': 'unknown evaluationId'})
 
         stored_digest, jwk_json, stored_commit_json, status = row
+
+        # Check commit replay first
+        if status == 'completed' and stored_commit_json:
+            conn.close()
+            if stored_digest == input_digest:
+                return self.reply(200, json.loads(stored_commit_json))
+            else:
+                return self.reply(409, {'error': 'inputDigest mismatch on commit replay'})
+
         if stored_digest != input_digest:
             conn.close()
             return self.reply(409, {'error': 'inputDigest mismatch for evaluationId'})
-
-        if status == 'completed' and stored_commit_json:
-            conn.close()
-            return self.reply(200, json.loads(stored_commit_json))
 
         jwk = json.loads(jwk_json)
 
@@ -801,11 +804,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             accepted = r.get('accepted', False)
             out_status = "executed" if accepted is True else "rejected"
 
+            # Echo the exact supplied receipt bindings
             outcomes_list.append({
-                "dossierId": d_id,
-                "callId": p['callId'],
-                "action": p['action'],
-                "proposalDigest": p['proposalDigest'],
+                "dossierId": r.get('dossierId'),
+                "callId": r.get('callId'),
+                "action": r.get('action'),
+                "proposalDigest": r.get('proposalDigest'),
                 "receiptId": r.get('receiptId'),
                 "status": out_status
             })
