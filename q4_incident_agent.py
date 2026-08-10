@@ -164,7 +164,6 @@ def build_otlp_trace(state: dict) -> dict:
         "attributes": model_attr
     })
 
-    # Map receipts by actionId and attempt
     receipt_map = {}
     for r in state.get("receiptLog", []):
         a_id = r.get("actionId")
@@ -283,6 +282,31 @@ def build_otlp_trace(state: dict) -> dict:
         ]
     }
 
+def format_response_for_state(state: dict) -> dict:
+    status = state.get("status")
+    run_id = state.get("runId")
+    diagnosis = state.get("diagnosis")
+    
+    if status == "waiting":
+        return {
+            "runId": run_id,
+            "status": "waiting",
+            "diagnosis": diagnosis,
+            "dispatches": state.get("dispatches", []),
+            "approvals": state.get("approvals", [])
+        }
+    else:
+        return {
+            "runId": run_id,
+            "status": status,
+            "diagnosis": diagnosis,
+            "chosenEffect": state.get("chosenEffect", "scale_service"),
+            "suppressed": state.get("suppressed", []),
+            "actionLog": state.get("actionLog", []),
+            "receiptLog": state.get("receiptLog", []),
+            "otlp": state.get("otlp", {})
+        }
+
 def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes):
     clean_path = path.split('?')[0]
     clean_path = re.sub(r'/+', '/', clean_path).rstrip('/')
@@ -300,7 +324,7 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
         if not row:
             return 404, {"error": "Run ID not found"}
         state = json.loads(row[0])
-        return 200, state
+        return 200, format_response_for_state(state)
 
     # ROUTE 2: POST /v2/incidents/{runId}/receipts
     m_rec = re.match(r'^/v2/incidents/([A-Za-z0-9_-]+)/receipts$', clean_path)
@@ -337,7 +361,7 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
 
         if state["status"] in ["completed", "failed"]:
             conn.close()
-            return 200, state
+            return 200, format_response_for_state(state)
 
         outcomes = receipt_req.get("outcomes", [])
         appr_receipts = receipt_req.get("approvals", [])
@@ -483,7 +507,7 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
 
         conn.commit()
         conn.close()
-        return 200, state
+        return 200, format_response_for_state(state)
 
     # ROUTE 3: POST /v2/incidents
     if method == 'POST' and ('incidents' in clean_path or clean_path.endswith('/incidents')):
@@ -510,7 +534,7 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
             stored_hash, stored_state_json = run_row
             conn.close()
             if stored_hash == req_hash:
-                return 200, json.loads(stored_state_json)
+                return 200, format_response_for_state(json.loads(stored_state_json))
             else:
                 return 409, {"error": "runId conflict with changed content"}
 
@@ -580,7 +604,7 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
 
         conn.commit()
         conn.close()
-        return 200, state
+        return 200, format_response_for_state(state)
 
     conn.close()
     return 404, {"error": "Unknown incident route"}
