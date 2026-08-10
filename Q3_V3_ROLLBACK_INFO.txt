@@ -1,0 +1,1 @@
+Current Q3 candidate is V3. Q3 V1 remains preserved at commit c85d68e26334a01b6a10a88a6b661d9890f3890a on branch q3-v1. Roll back there if the grader score decreases.
