@@ -20,7 +20,25 @@ SAFE_FIXTURES = {
     'encoded/%2e%2e-literal.txt': 'SAFE_ENCODED_4c73da330700189b48dd4c67',
 }
 
-ALLOWED_HOSTS = {'example.com', 'www.iana.org'}
+ALLOWED_NETLOCS_HTTP = {'example.com', 'example.com:80', 'www.iana.org', 'www.iana.org:80'}
+ALLOWED_NETLOCS_HTTPS = {'example.com', 'example.com:443', 'www.iana.org', 'www.iana.org:443'}
+
+UNSAFE_PATTERNS = [
+    '127.0.0.1',
+    '169.254.169.254',
+    '169.254.',
+    '0.0.0.0',
+    '::1',
+    '::ffff:',
+    'localhost',
+    'metadata.google.internal',
+    'instance-data',
+    '0x7f',
+    '2130706433',
+    '10.0.0.',
+    '192.168.',
+    '172.16.',
+]
 
 def init_environment():
     """Ensure all required files exist on the filesystem before handling requests."""
@@ -145,9 +163,23 @@ def is_ip_unsafe(ip_str: str) -> bool:
 def validate_url(url_str: str):
     if not isinstance(url_str, str) or len(url_str) > 8192 or not url_str.strip():
         return False, 'invalid URL format'
+        
     if any(ord(c) < 32 or ord(c) == 127 for c in url_str):
         return False, 'control characters in URL'
+
+    # Check unquoted versions for embedded unsafe IP/metadata patterns in path or query
+    s = url_str
+    for _ in range(5):
+        unq = urllib.parse.unquote(s)
+        if unq == s:
+            break
+        s = unq
         
+    s_lower = s.lower()
+    for pattern in UNSAFE_PATTERNS:
+        if pattern in s_lower:
+            return False, f'unsafe pattern {pattern} detected in URL'
+
     try:
         parsed = urllib.parse.urlsplit(url_str)
     except Exception:
@@ -157,48 +189,23 @@ def validate_url(url_str: str):
     if scheme not in ('http', 'https'):
         return False, 'only http and https schemes are allowed'
         
-    netloc = parsed.netloc
-    if not netloc or '@' in netloc or '\\' in netloc or '%40' in netloc.lower() or '%5c' in netloc.lower():
-        return False, 'userinfo or invalid authority in URL'
+    netloc = (parsed.netloc or '').lower()
+    if not netloc:
+        return False, 'missing network location'
         
-    if parsed.username is not None or parsed.password is not None:
-        return False, 'userinfo is not allowed'
-        
-    hostname = parsed.hostname
-    if not hostname:
-        return False, 'missing hostname'
-        
-    # Check raw IP address
-    try:
-        ipaddress.ip_address(hostname)
-        return False, 'raw IP addresses are not allowed'
-    except ValueError:
-        pass
+    if scheme == 'http':
+        if netloc not in ALLOWED_NETLOCS_HTTP:
+            return False, f'netloc {netloc} is not allowed for HTTP'
+    elif scheme == 'https':
+        if netloc not in ALLOWED_NETLOCS_HTTPS:
+            return False, f'netloc {netloc} is not allowed for HTTPS'
 
-    try:
-        norm_host = hostname.encode('idna').decode('ascii').lower().rstrip('.')
-    except Exception:
-        return False, 'invalid host encoding'
-        
-    if norm_host not in ALLOWED_HOSTS:
-        return False, f'host {norm_host} is not allowed'
-        
-    try:
-        port = parsed.port
-    except ValueError:
-        return False, 'invalid port'
-
-    # Strict port & scheme alignment
-    if scheme == 'http' and port not in (None, 80):
-        return False, 'HTTP scheme requires port 80 or default'
-    if scheme == 'https' and port not in (None, 443):
-        return False, 'HTTPS scheme requires port 443 or default'
-
-    effective_port = port if port is not None else (443 if scheme == 'https' else 80)
+    hostname = (parsed.hostname or '').lower()
+    port = parsed.port if parsed.port is not None else (443 if scheme == 'https' else 80)
 
     # DNS Resolution check
     try:
-        addr_info = socket.getaddrinfo(norm_host, effective_port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         if not addr_info:
             return False, 'DNS resolution returned no addresses'
         for info in addr_info:
@@ -208,7 +215,7 @@ def validate_url(url_str: str):
     except Exception as e:
         return False, f'DNS resolution failed: {e}'
 
-    return True, norm_host
+    return True, hostname
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
