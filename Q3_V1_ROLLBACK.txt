@@ -1,0 +1,1 @@
+Q3 V1 rollback baseline: commit c85d68e26334a01b6a10a88a6b661d9890f3890a. Exact pre-improvement Q3 repository state.
