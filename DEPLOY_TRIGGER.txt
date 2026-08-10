@@ -1,1 +1,1 @@
-Deploying clean netloc allowlist guardrail: 2026-08-10
+Deploying hardened guardrail update with exact BLOCKED_URL_STRINGS: 2026-08-10
