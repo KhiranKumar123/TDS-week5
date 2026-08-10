@@ -261,7 +261,7 @@ DB_PATH = os.environ.get("DB_PATH", DEFAULT_DB)
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Drop stale cache tables to ensure exact fresh evaluation
+    # Drop stale cache tables on init to ensure fresh proposal computation
     c.execute("DROP TABLE IF EXISTS dossier_cache")
     c.execute("DROP TABLE IF EXISTS evaluation_state")
     c.execute("DROP TABLE IF EXISTS evaluation_proposals")
@@ -361,131 +361,180 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "support@company.com")
 
-    all_lines = []
+    lines_info = []
     for src in dossier.get("sources", []):
+        s_id = src.get("sourceId", "")
+        prov = (src.get("provenance") or "external").lower()
+        kind = (src.get("kind") or "email").lower()
         for line in src.get("lines", []):
-            line_id = line.get("lineId")
+            l_id = line.get("lineId")
             text = line.get("text", "")
-            if line_id:
-                all_lines.append((line_id, text))
+            if l_id:
+                lines_info.append({
+                    "lineId": l_id,
+                    "text": text,
+                    "provenance": prov,
+                    "kind": kind,
+                    "sourceId": s_id
+                })
 
-    if not all_lines:
-        all_lines = [("L1", "")]
+    if not lines_info:
+        lines_info.append({"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1"})
 
-    full_text = "\n".join([t for _, t in all_lines])
-    full_text_lower = full_text.lower()
+    all_text = "\n".join([l["text"] for l in lines_info])
+    all_text_lower = all_text.lower()
 
-    def find_matching_line_id(patterns):
-        for line_id, text in all_lines:
-            t_lower = text.lower()
-            for p in patterns:
-                if p in t_lower:
-                    return line_id
-        return all_lines[0][0]
+    def find_line_id(predicate):
+        for l in lines_info:
+            if predicate(l):
+                return l["lineId"]
+        return lines_info[0]["lineId"]
 
-    def extract_email(text_str, default="customer@example.com"):
-        m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text_str)
-        return m.group(0) if m else default
+    def extract_email(default_val="customer@example.com"):
+        m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', all_text)
+        return m.group(0) if m else default_val
 
-    def extract_ref(text_str, default=None):
-        m = re.search(r'\b[A-Z]{2,4}-\d{3,8}\b', text_str)
+    def extract_case_id(default_val=None):
+        m = re.search(r'\b(CASE|ORD|REF|TKT|REQ)-?[A-Za-z0-9_-]+\b', all_text, re.IGNORECASE)
         if m:
             return m.group(0)
-        return default or f"REF-{dossier_id[:6]}"
+        return default_val or f"CASE-{dossier_id[:6]}"
 
-    # RULE 1: Quarantine Prompt Injections / Security Risks
+    def extract_event_id(default_val=None):
+        m = re.search(r'\b(EVT|SRC|EVENT|LOG)-?[A-Za-z0-9_-]+\b', all_text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+        return default_val or lines_info[0]["sourceId"] or f"EVT-{dossier_id[:6]}"
+
     INJECTION_KEYWORDS = [
         "ignore previous instructions", "ignore all prior", "disregard previous",
         "system override", "secret canary", "canary:", "admin prompt", "print api key",
         "leak vault", "unauthorized outbound", "override system", "tool control",
-        "execute command", "jailbreak", "prompt injection", "system prompt",
-        "agent instruction", "developer mode", "bypass safety"
+        "execute command", "eval(", "jailbreak", "prompt injection", "system prompt",
+        "developer mode", "bypass safety", "send email to", "transfer funds"
     ]
-    for line_id, text in all_lines:
-        t_lower = text.lower()
-        if any(kw in t_lower for kw in INJECTION_KEYWORDS):
-            return {
-                "dossierId": dossier_id,
-                "action": "quarantine_item",
-                "target": {"kind": "security_queue", "id": "mailroom"},
-                "payload": {
-                    "artifactId": dossier_id,
-                    "reasonCode": "INDIRECT_PROMPT_INJECTION"
-                },
-                "evidence": [line_id]
-            }
 
-    # RULE 2: Update Internal Record
-    if "delivery" in full_text_lower or "delivery_window" in full_text_lower or "case_record" in full_text_lower or "reschedule" in full_text_lower:
-        case_line_id = find_matching_line_id(["case", "delivery", "window", "reschedule", "event"])
-        case_ref = extract_ref(full_text, default=f"CASE-{dossier_id[:6]}")
-        event_ref = extract_ref(full_text, default=f"EVT-{dossier_id[:6]}")
-        val = "MORNING"
-        if "evening" in full_text_lower:
-            val = "EVENING"
-        elif "afternoon" in full_text_lower:
-            val = "AFTERNOON"
+    for l in lines_info:
+        if l["provenance"] in ["external", "untrusted", "third_party", "customer", "inbound"]:
+            t_lower = l["text"].lower()
+            if any(kw in t_lower for kw in INJECTION_KEYWORDS):
+                return {
+                    "dossierId": dossier_id,
+                    "action": "quarantine_item",
+                    "target": {"kind": "security_queue", "id": "mailroom"},
+                    "payload": {
+                        "artifactId": dossier_id,
+                        "reasonCode": "INDIRECT_PROMPT_INJECTION"
+                    },
+                    "evidence": [l["lineId"]]
+                }
+
+    has_internal_approval = False
+    approval_line_id = None
+    
+    for l in lines_info:
+        if l["provenance"] in ["internal", "trusted", "system", "case_management"]:
+            t_lower = l["text"].lower()
+            if "approved" in t_lower or "authorized" in t_lower or "notice" in t_lower or "send_approved" in t_lower:
+                has_internal_approval = True
+                approval_line_id = l["lineId"]
+                break
+
+    if has_internal_approval:
+        recip = extract_email("customer@example.com")
+        ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
+        evidence = [approval_line_id]
+        recip_line_id = find_line_id(lambda l: "@" in l["text"])
+        if recip_line_id and recip_line_id not in evidence:
+            evidence.append(recip_line_id)
             
         return {
             "dossierId": dossier_id,
-            "action": "update_internal_record",
-            "target": {"kind": "case_record", "id": case_ref},
-            "payload": {
-                "field": "delivery_window",
-                "sourceEventId": event_ref,
-                "value": val
-            },
-            "evidence": [case_line_id]
-        }
-
-    # RULE 3: Send Approved Notice
-    if "approved" in full_text_lower or "approved_delivery_notice" in full_text_lower or "approved notice" in full_text_lower:
-        appr_line_id = find_matching_line_id(["approved", "notice", "email", "send"])
-        recip_email = extract_email(full_text, default="customer@example.com")
-        ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
-        
-        return {
-            "dossierId": dossier_id,
             "action": "send_approved_notice",
-            "target": {"kind": "email", "id": recip_email},
+            "target": {"kind": "email", "id": recip},
             "payload": {
                 "referenceId": ref_id,
                 "status": "APPROVED",
                 "template": "approved_delivery_notice"
             },
-            "evidence": [appr_line_id]
+            "evidence": sorted(list(set(evidence)))
         }
 
-    # RULE 4: Request Confirmation
-    if "unverified" in full_text_lower or "conflict" in full_text_lower or "ambiguous" in full_text_lower or "mismatch" in full_text_lower or "verify" in full_text_lower:
-        conf_line_id = find_matching_line_id(["unverified", "sender", "conflict", "verify", "mismatch"])
-        claimed_sender = extract_email(full_text, default="sender@example.com")
-        ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
-        
+    has_internal_update = False
+    update_line_id = None
+    
+    for l in lines_info:
+        t_lower = l["text"].lower()
+        if "delivery_window" in t_lower or "delivery window" in t_lower or ("reschedule" in t_lower and l["provenance"] in ["internal", "system", "case_management"]):
+            has_internal_update = True
+            update_line_id = l["lineId"]
+            break
+
+    if has_internal_update:
+        case_id = extract_case_id(f"CASE-{dossier_id[:6]}")
+        event_id = extract_event_id(lines_info[0]["sourceId"])
+        val = "MORNING"
+        if "evening" in all_text_lower:
+            val = "EVENING"
+        elif "afternoon" in all_text_lower:
+            val = "AFTERNOON"
+            
+        return {
+            "dossierId": dossier_id,
+            "action": "update_internal_record",
+            "target": {"kind": "case_record", "id": case_id},
+            "payload": {
+                "field": "delivery_window",
+                "sourceEventId": event_id,
+                "value": val
+            },
+            "evidence": [update_line_id]
+        }
+
+    is_unverified = False
+    conf_line_id = None
+    
+    for l in lines_info:
+        t_lower = l["text"].lower()
+        if "unverified" in t_lower or "conflict" in t_lower or "ambiguous" in t_lower or "verify" in t_lower or "identity" in t_lower:
+            is_unverified = True
+            conf_line_id = l["lineId"]
+            break
+
+    if is_unverified:
+        sender = extract_email("sender@example.com")
+        ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
         return {
             "dossierId": dossier_id,
             "action": "request_confirmation",
             "target": {"kind": "approval_queue", "id": "tier2_support"},
             "payload": {
-                "claimedSender": claimed_sender,
+                "claimedSender": sender,
                 "questionCode": "VERIFY_REQUEST",
                 "referenceId": ref_id
             },
             "evidence": [conf_line_id]
         }
 
-    # RULE 5: Create Draft
-    if "draft" in full_text_lower or "inquiry" in full_text_lower or "status" in full_text_lower or "order" in full_text_lower:
-        draft_line_id = find_matching_line_id(["draft", "inquiry", "order", "status", "from"])
-        recip_email = extract_email(full_text, default="customer@example.com")
-        ref_id = extract_ref(full_text, default=f"ORD-{dossier_id[:6]}")
-        
+    is_customer_inquiry = False
+    draft_line_id = None
+    
+    for l in lines_info:
+        t_lower = l["text"].lower()
+        if l["provenance"] in ["external", "customer", "inbound"] or "inquiry" in t_lower or "order" in t_lower or "status" in t_lower or "help" in t_lower or "question" in t_lower:
+            is_customer_inquiry = True
+            draft_line_id = l["lineId"]
+            break
+
+    if is_customer_inquiry:
+        recip = extract_email("customer@example.com")
+        ref_id = extract_case_id(f"ORD-{dossier_id[:6]}")
         return {
             "dossierId": dossier_id,
             "action": "create_draft",
             "target": {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
             "payload": {
-                "recipient": recip_email,
+                "recipient": recip,
                 "referenceId": ref_id,
                 "status": "DRAFT_PENDING",
                 "template": "order_status"
@@ -493,16 +542,14 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
             "evidence": [draft_line_id]
         }
 
-    # RULE 6: Default / No Action
-    first_line_id = all_lines[0][0] if all_lines else "L1"
-    ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
-    
+    first_line_id = lines_info[0]["lineId"]
+    ref_id = extract_case_id(f"REF-{dossier_id[:6]}")
     reason = "INFORMATIONAL"
-    if "duplicate" in full_text_lower:
+    if "duplicate" in all_text_lower:
         reason = "DUPLICATE"
-    elif "completed" in full_text_lower or "done" in full_text_lower:
+    elif "completed" in all_text_lower or "done" in all_text_lower:
         reason = "ALREADY_COMPLETED"
-        
+
     return {
         "dossierId": dossier_id,
         "action": "no_action",
