@@ -48,8 +48,38 @@ def canonical_json_bytes(obj) -> bytes:
 def compute_hash(obj) -> str:
     return hashlib.sha256(canonical_json_bytes(obj)).hexdigest().lower()
 
-def random_hex(length: int) -> str:
-    return hashlib.md5(f"{time.time()}_{os.urandom(16)}".encode()).hexdigest()[:length]
+def generate_tool_arguments(tool_info: dict, incident_info: dict) -> dict:
+    schema = tool_info.get("inputSchema", {})
+    props = schema.get("properties", {})
+    
+    args = {}
+    service_val = incident_info.get("service", "billing-service")
+    inc_id = incident_info.get("incidentId", "inc_1001")
+    title_val = incident_info.get("title", "")
+    
+    for prop_name, prop_def in props.items():
+        p_lower = prop_name.lower()
+        if "service" in p_lower:
+            args[prop_name] = service_val
+        elif "incident" in p_lower:
+            args[prop_name] = inc_id
+        elif "severity" in p_lower:
+            args[prop_name] = incident_info.get("severity", "SEV-1")
+        elif "environment" in p_lower or "env" in p_lower:
+            args[prop_name] = "production"
+        elif "component" in p_lower:
+            args[prop_name] = service_val
+        elif "metric" in p_lower:
+            args[prop_name] = "latency" if "latency" in title_val.lower() else "cpu_utilization"
+        elif "query" in p_lower:
+            args[prop_name] = f"service={service_val}"
+        else:
+            args[prop_name] = "default_val"
+            
+    if not args:
+        args = {"service": service_val}
+        
+    return args
 
 def analyze_incident(incident_data: dict) -> dict:
     transcript = incident_data.get("transcript", "")
@@ -58,7 +88,6 @@ def analyze_incident(incident_data: dict) -> dict:
     # Extract evidence IDs (ev_...)
     found_ev = RE_EV_BRACKETS.findall(transcript)
     if not found_ev:
-        # Fallback to any bracketed ref
         found_ev = re.findall(r'\[([A-Za-z0-9_-]+)\]', transcript)
         
     unique_ev = []
@@ -90,7 +119,6 @@ def build_otlp_trace(state: dict) -> dict:
     run_id = state.get("runId", "run_0")
     public_marker = state.get("publicMarker", "marker_0")
     
-    # Trace ID & Root Span ID
     trace_id = state.get("traceId") or f"{hashlib.sha256(run_id.encode()).hexdigest()[:32]}"
     server_span_id = state.get("serverSpanId") or f"{hashlib.md5((run_id + '_server').encode()).hexdigest()[:16]}"
     agent_span_id = f"{hashlib.md5((run_id + '_agent').encode()).hexdigest()[:16]}"
@@ -137,30 +165,31 @@ def build_otlp_trace(state: dict) -> dict:
         "attributes": model_attr
     })
 
-    # Tool execution spans & CLIENT spans
-    executed_action_spans = []
-    receipt_log = state.get("receiptLog", [])
-    action_log = state.get("actionLog", [])
-    
-    # Map receipt details by actionId / callId / attempt
+    # Map receipts by actionId and attempt
     receipt_map = {}
-    for r in receipt_log:
+    for r in state.get("receiptLog", []):
         a_id = r.get("actionId")
         if a_id:
             receipt_map[a_id] = r
+
+    logical_tool_span_ids = []
+    action_log = state.get("actionLog", [])
 
     for disp in action_log:
         act_id = disp.get("actionId")
         call_id = disp.get("callId")
         tool_name = disp.get("toolName")
         attempt = disp.get("attempt", 1)
+        traceparent = disp.get("traceparent", "")
         
+        # Extract CLIENT span ID from traceparent (00-traceId-spanId-01)
+        tp_parts = traceparent.split('-')
+        client_span_id = tp_parts[2] if len(tp_parts) >= 4 else f"{hashlib.md5((act_id + str(attempt)).encode()).hexdigest()[:16]}"
         logical_span_id = f"{hashlib.md5((run_id + act_id).encode()).hexdigest()[:16]}"
-        client_span_id = f"{hashlib.md5((run_id + act_id + str(attempt)).encode()).hexdigest()[:16]}"
-        
+
         # 4. INTERNAL execute_tool <toolName> (SpanKind = 1)
-        if logical_span_id not in executed_action_spans:
-            executed_action_spans.append(logical_span_id)
+        if logical_span_id not in logical_tool_span_ids:
+            logical_tool_span_ids.append(logical_span_id)
             tool_attr = base_attr + [
                 {"key": "ga5.action.id", "value": {"stringValue": act_id}},
                 {"key": "gen_ai.tool.name", "value": {"stringValue": tool_name}},
@@ -178,10 +207,10 @@ def build_otlp_trace(state: dict) -> dict:
 
         # 5. CLIENT POST tool/<toolName> (SpanKind = 3)
         r_info = receipt_map.get(act_id, {})
-        rec_id = r_info.get("receiptId", f"rec_{act_id[:6]}")
-        rec_nonce = r_info.get("nonce", f"nonce_{act_id[:6]}")
+        rec_id = r_info.get("receiptId", f"rec_{act_id[:8]}")
+        rec_nonce = r_info.get("nonce", f"nonce_{act_id[:8]}")
         status_code = r_info.get("status", 200)
-        
+
         client_attr = base_attr + [
             {"key": "ga5.action.id", "value": {"stringValue": act_id}},
             {"key": "ga5.attempt", "value": {"intValue": attempt}},
@@ -191,7 +220,7 @@ def build_otlp_trace(state: dict) -> dict:
             {"key": "http.request.resend_count", "value": {"intValue": attempt - 1}},
             {"key": "http.response.status_code", "value": {"intValue": status_code}}
         ]
-        
+
         client_span = {
             "traceId": trace_id,
             "spanId": client_span_id,
@@ -200,35 +229,48 @@ def build_otlp_trace(state: dict) -> dict:
             "kind": 3,
             "attributes": client_attr
         }
-        
+
         if status_code != 200:
-            client_span["status"] = {"code": 2, "message": f"Error {status_code}"}
+            client_span["status"] = {"code": 2, "message": f"HTTP {status_code}"}
             client_span["attributes"].append({"key": "error.type", "value": {"stringValue": str(status_code)}})
-            
+
         spans.append(client_span)
 
     # 6. INTERNAL incident.join (when diagnostics fan out)
-    if len(action_log) > 1:
+    if len(logical_tool_span_ids) > 1:
         join_span_id = f"{hashlib.md5((run_id + '_join').encode()).hexdigest()[:16]}"
+        links = [{"traceId": trace_id, "spanId": l_id} for l_id in logical_tool_span_ids]
         spans.append({
             "traceId": trace_id,
             "spanId": join_span_id,
             "parentSpanId": agent_span_id,
             "name": "incident.join",
             "kind": 1,
-            "attributes": base_attr
+            "attributes": base_attr,
+            "links": links
         })
 
     # 7. INTERNAL approval_gate (when approval is required)
-    if state.get("approvals") or any("approvalId" in r for r in receipt_log):
+    approvals = state.get("approvals", [])
+    receipt_log = state.get("receiptLog", [])
+    appr_receipts = [r for r in receipt_log if "approvalId" in r]
+
+    if approvals or appr_receipts:
         appr_span_id = f"{hashlib.md5((run_id + '_approval').encode()).hexdigest()[:16]}"
+        appr_id = approvals[0]["approvalId"] if approvals else appr_receipts[0]["approvalId"]
+        appr_nonce = appr_receipts[0].get("nonce", "nonce_appr_default") if appr_receipts else "nonce_pending"
+        
+        gate_attr = base_attr + [
+            {"key": "ga5.approval.id", "value": {"stringValue": appr_id}},
+            {"key": "ga5.receipt.nonce", "value": {"stringValue": appr_nonce}}
+        ]
         spans.append({
             "traceId": trace_id,
             "spanId": appr_span_id,
             "parentSpanId": agent_span_id,
             "name": "approval_gate",
             "kind": 1,
-            "attributes": base_attr
+            "attributes": gate_attr
         })
 
     return {
@@ -297,7 +339,6 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
 
         if state["status"] in ["completed", "failed"]:
             conn.close()
-            # Return cached terminal state for replay
             return 200, state
 
         outcomes = receipt_req.get("outcomes", [])
@@ -305,19 +346,46 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
 
         # Process tool outcomes
         for out in outcomes:
+            status_code = out.get("status", 200)
+            act_id = out.get("actionId")
+            call_id = out.get("callId")
+            attempt = out.get("attempt", 1)
+
             state["receiptLog"].append({
                 "receiptId": rec_id,
-                "actionId": out.get("actionId"),
-                "callId": out.get("callId"),
-                "attempt": out.get("attempt", 1),
-                "status": out.get("status", 200),
+                "actionId": act_id,
+                "callId": call_id,
+                "attempt": attempt,
+                "status": status_code,
                 "resultClass": out.get("resultClass", "diagnosis_confirmed"),
                 "nonce": out.get("nonce", "nonce_123")
             })
 
-            # Check if diagnosis succeeded
-            if out.get("status") == 200:
-                # Transition to Effect Phase
+            # Check 503 Retry
+            if status_code == 503 and attempt < 2:
+                # Find dispatch to retry
+                retry_disp = None
+                for d in state["actionLog"]:
+                    if d["actionId"] == act_id:
+                        retry_disp = dict(d)
+                        break
+
+                if retry_disp:
+                    retry_disp["attempt"] = 2
+                    client_span_id = f"{hashlib.md5((act_id + '2').encode()).hexdigest()[:16]}"
+                    retry_disp["traceparent"] = f"00-{state['traceId']}-{client_span_id}-01"
+                    state["actionLog"].append(retry_disp)
+                    state["dispatches"] = [retry_disp]
+                    state["status"] = "waiting"
+
+            # Check timeout failure (status 0)
+            elif status_code == 0 or out.get("errorType") == "timeout":
+                state["status"] = "failed"
+                state["dispatches"] = []
+                state["approvals"] = []
+
+            # Successful diagnosis (200)
+            elif status_code == 200:
                 policy = input_data.get("policy", {})
                 effect_tools = policy.get("effectTools", ["scale_service"])
                 appr_req = policy.get("approvalRequiredFor", [])
@@ -325,35 +393,40 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
                 chosen_effect = effect_tools[0] if effect_tools else "scale_service"
                 state["chosenEffect"] = chosen_effect
 
+                # Find tool catalog info for effect arguments
+                catalog = input_data.get("toolCatalog", [])
+                eff_tool_info = next((t for t in catalog if t["name"] == chosen_effect), {"name": chosen_effect})
+                eff_args = generate_tool_arguments(eff_tool_info, input_data.get("incident", {}))
+                eff_act_id = f"act_eff_{hashlib.md5((run_id + chosen_effect).encode()).hexdigest()[:12]}"
+
                 if chosen_effect in appr_req:
-                    # Require Approval first
+                    # Require Approval
                     appr_id = f"appr_{hashlib.md5((run_id + chosen_effect).encode()).hexdigest()[:12]}"
-                    act_id = f"act_eff_{hashlib.md5((run_id + chosen_effect).encode()).hexdigest()[:12]}"
-                    digest = hashlib.sha256(canonical_json_bytes({"service": input_data["incident"]["service"]})).hexdigest().lower()
-                    
+                    digest = hashlib.sha256(canonical_json_bytes(eff_args)).hexdigest().lower()
+
                     state["status"] = "waiting"
                     state["dispatches"] = []
                     state["approvals"] = [{
                         "approvalId": appr_id,
-                        "actionId": act_id,
+                        "actionId": eff_act_id,
                         "toolName": chosen_effect,
                         "argumentsDigest": digest
                     }]
                 else:
-                    # Perform Effect tool immediately
-                    act_id = f"act_eff_{hashlib.md5((run_id + chosen_effect).encode()).hexdigest()[:12]}"
+                    # Dispatch Effect Tool immediately
                     call_id = f"call_eff_{hashlib.md5((run_id + chosen_effect).encode()).hexdigest()[:12]}"
-                    client_span = f"00-{state['traceId']}-{hashlib.md5((act_id + '1').encode()).hexdigest()[:16]}-01"
+                    client_span_id = f"{hashlib.md5((eff_act_id + '1').encode()).hexdigest()[:16]}"
+                    traceparent = f"00-{state['traceId']}-{client_span_id}-01"
 
                     eff_disp = {
-                        "actionId": act_id,
+                        "actionId": eff_act_id,
                         "callId": call_id,
                         "phase": "effect",
                         "toolName": chosen_effect,
-                        "arguments": {"service": input_data["incident"]["service"]},
+                        "arguments": eff_args,
                         "evidence": state["diagnosis"]["evidence"],
                         "attempt": 1,
-                        "traceparent": client_span
+                        "traceparent": traceparent
                     }
                     state["actionLog"].append(eff_disp)
                     state["status"] = "completed"
@@ -363,17 +436,49 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
         # Process approval receipts
         for a in appr_receipts:
             if a.get("decision") == "approved":
+                appr_id = a.get("approvalId")
+                nonce_val = a.get("nonce", "nonce_appr_123")
+
                 state["receiptLog"].append({
                     "receiptId": rec_id,
-                    "approvalId": a.get("approvalId"),
+                    "approvalId": appr_id,
                     "decision": "approved",
-                    "nonce": a.get("nonce")
+                    "nonce": nonce_val
                 })
+
+                # Find pending approval actionId
+                policy = input_data.get("policy", {})
+                effect_tools = policy.get("effectTools", ["scale_service"])
+                chosen_effect = state.get("chosenEffect") or (effect_tools[0] if effect_tools else "scale_service")
+                eff_act_id = f"act_eff_{hashlib.md5((run_id + chosen_effect).encode()).hexdigest()[:12]}"
+
+                catalog = input_data.get("toolCatalog", [])
+                eff_tool_info = next((t for t in catalog if t["name"] == chosen_effect), {"name": chosen_effect})
+                eff_args = generate_tool_arguments(eff_tool_info, input_data.get("incident", {}))
+
+                call_id = f"call_eff_{hashlib.md5((run_id + chosen_effect).encode()).hexdigest()[:12]}"
+                client_span_id = f"{hashlib.md5((eff_act_id + '1').encode()).hexdigest()[:16]}"
+                traceparent = f"00-{state['traceId']}-{client_span_id}-01"
+
+                eff_disp = {
+                    "actionId": eff_act_id,
+                    "callId": call_id,
+                    "approvalId": appr_id,
+                    "approvalNonce": nonce_val,
+                    "phase": "effect",
+                    "toolName": chosen_effect,
+                    "arguments": eff_args,
+                    "evidence": state["diagnosis"]["evidence"],
+                    "attempt": 1,
+                    "traceparent": traceparent
+                }
+
+                state["actionLog"].append(eff_disp)
                 state["status"] = "completed"
                 state["dispatches"] = []
                 state["approvals"] = []
 
-        # Build OTLP trace
+        # Rebuild OTLP trace
         state["otlp"] = build_otlp_trace(state)
 
         # Update DB
@@ -388,7 +493,7 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
         return 200, state
 
     # ROUTE 3: POST /v2/incidents
-    if method == 'POST' and (clean_path == '/v2/incidents' or clean_path.endswith('/incidents')):
+    if method == 'POST' and ('incidents' in clean_path or clean_path.endswith('/incidents')):
         try:
             req_body = json.loads(raw_body.decode('utf-8'))
         except Exception:
@@ -413,51 +518,73 @@ def handle_incident_route(path: str, method: str, headers: dict, raw_body: bytes
             stored_hash, stored_state_json = run_row
             conn.close()
             if stored_hash == req_hash:
-                # Exact replay -> return cached stored state
                 return 200, json.loads(stored_state_json)
             else:
-                # Changed content conflict -> 409
                 return 409, {"error": "runId conflict with changed content"}
 
         # Analyze incident
-        diag = analyze_incident(req_body.get("incident", {}))
-        
-        # Build initial diagnostic dispatch
-        catalog = req_body.get("toolCatalog", [])
-        diag_tool = catalog[0]["name"] if catalog else "query_metrics"
-        
-        trace_id = f"{hashlib.sha256(run_id.encode()).hexdigest()[:32]}"
-        act_id = f"act_diag_{hashlib.md5((run_id + diag_tool).encode()).hexdigest()[:12]}"
-        call_id = f"call_diag_{hashlib.md5((run_id + diag_tool).encode()).hexdigest()[:12]}"
-        client_span_id = f"{hashlib.md5((act_id + '1').encode()).hexdigest()[:16]}"
-        traceparent = f"00-{trace_id}-{client_span_id}-01"
+        incident_info = req_body.get("incident", {})
+        diag = analyze_incident(incident_info)
 
-        diag_dispatch = {
-            "actionId": act_id,
-            "callId": call_id,
-            "phase": "diagnostic",
-            "toolName": diag_tool,
-            "arguments": {"metric": "latency", "service": req_body.get("incident", {}).get("service", "core")},
-            "evidence": [diag["evidence"][0]],
-            "attempt": 1,
-            "traceparent": traceparent
-        }
+        # Separate diagnostic tools from effect tools
+        catalog = req_body.get("toolCatalog", [])
+        policy = req_body.get("policy", {})
+        effect_tool_names = policy.get("effectTools", [])
+
+        diag_catalog = [t for t in catalog if t["name"] not in effect_tool_names]
+        if not diag_catalog:
+            diag_catalog = catalog[:1] if catalog else [{"name": "query_metrics", "inputSchema": {}}]
+
+        # Build 1 to 3 diagnostic dispatches before effects
+        max_diag = min(policy.get("maximumDiagnostics", 3), len(diag_catalog))
+        if max_diag < 1:
+            max_diag = 1
+
+        trace_id = f"{hashlib.sha256(run_id.encode()).hexdigest()[:32]}"
+        server_span_id = f"{hashlib.md5((run_id + '_server').encode()).hexdigest()[:16]}"
+
+        dispatches_list = []
+        for idx in range(max_diag):
+            tool_info = diag_catalog[idx]
+            tool_name = tool_info["name"]
+
+            act_id = f"act_diag_{hashlib.md5((run_id + tool_name).encode()).hexdigest()[:12]}"
+            call_id = f"call_diag_{hashlib.md5((run_id + tool_name).encode()).hexdigest()[:12]}"
+            client_span_id = f"{hashlib.md5((act_id + '1').encode()).hexdigest()[:16]}"
+            traceparent = f"00-{trace_id}-{client_span_id}-01"
+
+            args = generate_tool_arguments(tool_info, incident_info)
+
+            # Assign non-duplicate subset of evidence IDs
+            ev_subset = [diag["evidence"][idx % len(diag["evidence"])]]
+
+            disp = {
+                "actionId": act_id,
+                "callId": call_id,
+                "phase": "diagnostic",
+                "toolName": tool_name,
+                "arguments": args,
+                "evidence": ev_subset,
+                "attempt": 1,
+                "traceparent": traceparent
+            }
+            dispatches_list.append(disp)
 
         state = {
             "runId": run_id,
             "publicMarker": req_body.get("publicMarker", "marker_default"),
             "traceId": trace_id,
-            "serverSpanId": f"{hashlib.md5((run_id + '_server').encode()).hexdigest()[:16]}",
+            "serverSpanId": server_span_id,
             "status": "waiting",
             "diagnosis": diag,
-            "dispatches": [diag_dispatch],
+            "dispatches": dispatches_list,
             "approvals": [],
-            "actionLog": [diag_dispatch],
+            "actionLog": list(dispatches_list),
             "receiptLog": [],
             "suppressed": []
         }
 
-        # Build initial OTLP trace
+        # Build OTLP trace
         state["otlp"] = build_otlp_trace(state)
 
         # Store in DB
