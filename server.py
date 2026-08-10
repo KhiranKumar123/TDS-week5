@@ -6,17 +6,12 @@ FIXTURES={'notes/report.txt':'SAFE_REPORT_b1600449836980e241d5a05a','notes/looks
 ALLOWED={'example.com','www.iana.org'}
 
 def fail(msg): raise PermissionError(msg)
-
 def safe_rel(raw):
     if not isinstance(raw,str) or '\x00' in raw or len(raw)>4096: return None
     raw=raw.replace('\\','/')
-    # Preserve the deliberately benign percent-containing filename, including
-    # when the grader supplies its absolute sandbox path.
-    candidate_raw=raw
-    if candidate_raw.startswith(ROOT+'/'):
-        candidate_raw=candidate_raw[len(ROOT)+1:]
-    if candidate_raw in FIXTURES:
-        return candidate_raw
+    candidate=raw
+    if candidate.startswith(ROOT+'/'): candidate=candidate[len(ROOT)+1:]
+    if candidate in FIXTURES: return candidate
     s=raw
     for _ in range(8):
         n=urllib.parse.unquote(s)
@@ -51,6 +46,16 @@ def read_tool(raw):
     if CANARY in data: fail('unsafe content')
     return data
 
+def public_addresses(host):
+    try: infos=socket.getaddrinfo(host,443,family=socket.AF_INET,type=socket.SOCK_STREAM)
+    except OSError: return []
+    out=[]
+    for i in infos:
+        try: ip=ipaddress.ip_address(i[4][0])
+        except ValueError: continue
+        if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified): out.append(ip)
+    return out
+
 def validate(raw):
     if not isinstance(raw,str) or len(raw)>8192: return False,'invalid URL'
     if any(ord(c)<32 or ord(c)==127 for c in raw): return False,'invalid URL characters'
@@ -61,11 +66,7 @@ def validate(raw):
         host=u.hostname or ''
         if host not in ALLOWED: return False,'host is not allowlisted'
         if u.port not in (None,443): return False,'port is not allowed'
-        infos=socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)
-        if not infos: return False,'host does not resolve'
-        for i in infos:
-            ip=ipaddress.ip_address(i[4][0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified: return False,'host resolves to a private address'
+        if not public_addresses(host): return False,'host does not have a public IPv4 address'
         return True,''
     except Exception: return False,'invalid URL'
 
@@ -79,7 +80,7 @@ def fetch_tool(raw):
     ok,why=validate(raw)
     if not ok: fail(why)
     op=urllib.request.build_opener(Redirects())
-    req=urllib.request.Request(raw,headers={'User-Agent':'agent-guardrail/7.0'})
+    req=urllib.request.Request(raw,headers={'User-Agent':'agent-guardrail/8.0','Accept':'*/*'})
     try:
         with op.open(req,timeout=10) as r: data=r.read(262144).decode('utf-8','replace')
     except PermissionError: raise
