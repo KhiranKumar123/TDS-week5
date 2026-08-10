@@ -1,0 +1,1 @@
+Q3 V2 candidate. Q3 V1 is permanently preserved at branch q3-v1 and commit c85d68e26334a01b6a10a88a6b661d9890f3890a. If Q3 V2 scores lower, restore main to that exact commit.
