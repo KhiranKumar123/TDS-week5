@@ -1,2 +1,2 @@
-from server import Handler, read_file_tool, fetch_tool, canonical_path, validate_url
-handler = Handler
+from server import RequestHandler, handle_read_file, handle_fetch_url, validate_url
+handler = RequestHandler
