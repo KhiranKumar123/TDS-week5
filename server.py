@@ -12,6 +12,9 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
+# Import Question 3 module
+import q3_invoice_agent
+
 # ==========================================
 # QUESTION 1: AGENT GUARDRAIL (read_file / fetch_url)
 # ==========================================
@@ -359,83 +362,40 @@ def verify_receipt_signature(pubkey_jwk: dict, commit_eval_id: str, commit_input
         return False
 
 def generate_proposal_for_dossier(dossier: dict) -> dict:
-    dossier_id = str(dossier.get("dossierId") or dossier.get("id") or "dossier_0")
-    mailbox = str(dossier.get("mailbox") or "support@company.com")
+    dossier_id = dossier["dossierId"]
+    mailbox = dossier.get("mailbox", "support@company.com")
 
-    lines_info = []
-    
+    all_lines = []
     for src in dossier.get("sources", []):
-        s_id = str(src.get("sourceId") or src.get("id") or "src_1")
-        prov = str(src.get("provenance") or src.get("prov") or "external").lower()
-        kind = str(src.get("kind") or src.get("type") or "email").lower()
-        is_internal = prov in ["internal", "system", "trusted", "case_management", "vault", "security"] or "internal" in prov
-        
-        lines_list = src.get("lines") or src.get("content") or []
-        if isinstance(lines_list, list):
-            for l in lines_list:
-                if isinstance(l, dict):
-                    l_id = str(l.get("lineId") or l.get("id") or l.get("line_id") or "")
-                    text = str(l.get("text") or l.get("content") or l.get("value") or "")
-                    if l_id:
-                        lines_info.append({
-                            "lineId": l_id,
-                            "text": text,
-                            "provenance": prov,
-                            "kind": kind,
-                            "sourceId": s_id,
-                            "is_internal": is_internal
-                        })
-                elif isinstance(l, str):
-                    lines_info.append({
-                        "lineId": f"L{len(lines_info)+1}",
-                        "text": l,
-                        "provenance": prov,
-                        "kind": kind,
-                        "sourceId": s_id,
-                        "is_internal": is_internal
-                    })
+        for line in src.get("lines", []):
+            line_id = line.get("lineId")
+            text = line.get("text", "")
+            if line_id:
+                all_lines.append((line_id, text))
 
-    if not lines_info:
-        lines_info.append({"lineId": "L1", "text": "", "provenance": "external", "kind": "email", "sourceId": "s1", "is_internal": False})
+    if not all_lines:
+        all_lines = [("L1", "")]
 
-    full_text = "\n".join([l["text"] for l in lines_info])
+    full_text = "\n".join([t for _, t in all_lines])
     full_text_lower = full_text.lower()
 
     def find_matching_line_id(patterns):
-        for l in lines_info:
-            t_lower = l["text"].lower()
+        for line_id, text in all_lines:
+            t_lower = text.lower()
             for p in patterns:
                 if p in t_lower:
-                    return l["lineId"]
-        return lines_info[0]["lineId"]
+                    return line_id
+        return all_lines[0][0]
 
-    def extract_exact_email(default_val="customer@example.com"):
-        m1 = re.search(r'(?:From|To|Sender|Client|User|Email)[-:\s]*([\w\.-]+@[\w\.-]+\.\w+)', full_text, re.IGNORECASE)
-        if m1:
-            return m1.group(1)
-        m2 = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', full_text)
-        if m2:
-            return m2.group(0)
-        return default_val
+    def extract_email(text_str, default="customer@example.com"):
+        m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text_str)
+        return m.group(0) if m else default
 
-    def extract_exact_ref(default_val=None):
-        m1 = re.search(r'\b(?:Reference|Ref|Order|Case|Ticket|Req|ID|Number|#)[-:\s#]*([A-Za-z0-9_-]{3,24})\b', full_text, re.IGNORECASE)
-        if m1:
-            return m1.group(1)
-        m2 = re.search(r'\b(ORD|CASE|REF|TKT|REQ|EVT|DOC)[-:#\s]*([A-Za-z0-9_-]+)\b', full_text, re.IGNORECASE)
-        if m2:
-            return f"{m2.group(1).upper()}-{m2.group(2)}"
-        m3 = re.search(r'\b[A-Z]{2,4}\d{3,8}\b', full_text)
-        if m3:
-            return m3.group(0)
-        return default_val or f"REF-{dossier_id[:8]}"
-
-    def extract_exact_event_id():
-        for l in lines_info:
-            m = re.search(r'\b(EVT|EVENT|LOG|SRC)[-:#\s]*([A-Za-z0-9_-]+)\b', l["text"], re.IGNORECASE)
-            if m:
-                return f"{m.group(1).upper()}-{m.group(2)}"
-        return lines_info[0]["sourceId"]
+    def extract_ref(text_str, default=None):
+        m = re.search(r'\b[A-Z]{2,4}-\d{3,8}\b', text_str)
+        if m:
+            return m.group(0)
+        return default or f"REF-{dossier_id[:6]}"
 
     # RULE 1: Quarantine Prompt Injections / Security Risks
     INJECTION_KEYWORDS = [
@@ -445,26 +405,25 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         "execute command", "jailbreak", "prompt injection", "system prompt",
         "agent instruction", "developer mode", "bypass safety"
     ]
-    for l in lines_info:
-        if not l["is_internal"]:
-            t_lower = l["text"].lower()
-            if any(kw in t_lower for kw in INJECTION_KEYWORDS):
-                return {
-                    "dossierId": dossier_id,
-                    "action": "quarantine_item",
-                    "target": {"kind": "security_queue", "id": "mailroom"},
-                    "payload": {
-                        "artifactId": dossier_id,
-                        "reasonCode": "INDIRECT_PROMPT_INJECTION"
-                    },
-                    "evidence": [l["lineId"]]
-                }
+    for line_id, text in all_lines:
+        t_lower = text.lower()
+        if any(kw in t_lower for kw in INJECTION_KEYWORDS):
+            return {
+                "dossierId": dossier_id,
+                "action": "quarantine_item",
+                "target": {"kind": "security_queue", "id": "mailroom"},
+                "payload": {
+                    "artifactId": dossier_id,
+                    "reasonCode": "INDIRECT_PROMPT_INJECTION"
+                },
+                "evidence": [line_id]
+            }
 
     # RULE 2: Update Internal Record
     if "delivery" in full_text_lower or "delivery_window" in full_text_lower or "case_record" in full_text_lower or "reschedule" in full_text_lower:
         case_line_id = find_matching_line_id(["case", "delivery", "window", "reschedule", "event"])
-        case_ref = extract_exact_ref(f"CASE-{dossier_id[:6]}")
-        event_ref = extract_exact_event_id()
+        case_ref = extract_ref(full_text, default=f"CASE-{dossier_id[:6]}")
+        event_ref = extract_ref(full_text, default=f"EVT-{dossier_id[:6]}")
         val = "MORNING"
         if "evening" in full_text_lower:
             val = "EVENING"
@@ -486,8 +445,8 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # RULE 3: Send Approved Notice
     if "approved" in full_text_lower or "approved_delivery_notice" in full_text_lower or "approved notice" in full_text_lower:
         appr_line_id = find_matching_line_id(["approved", "notice", "email", "send"])
-        recip_email = extract_exact_email("customer@example.com")
-        ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
+        recip_email = extract_email(full_text, default="customer@example.com")
+        ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
         
         return {
             "dossierId": dossier_id,
@@ -504,8 +463,8 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # RULE 4: Request Confirmation
     if "unverified" in full_text_lower or "conflict" in full_text_lower or "ambiguous" in full_text_lower or "mismatch" in full_text_lower or "verify" in full_text_lower:
         conf_line_id = find_matching_line_id(["unverified", "sender", "conflict", "verify", "mismatch"])
-        claimed_sender = extract_exact_email("sender@example.com")
-        ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
+        claimed_sender = extract_email(full_text, default="sender@example.com")
+        ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
         
         return {
             "dossierId": dossier_id,
@@ -522,8 +481,8 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
     # RULE 5: Create Draft
     if "draft" in full_text_lower or "inquiry" in full_text_lower or "status" in full_text_lower or "order" in full_text_lower:
         draft_line_id = find_matching_line_id(["draft", "inquiry", "order", "status", "from"])
-        recip_email = extract_exact_email("customer@example.com")
-        ref_id = extract_exact_ref(f"ORD-{dossier_id[:6]}")
+        recip_email = extract_email(full_text, default="customer@example.com")
+        ref_id = extract_ref(full_text, default=f"ORD-{dossier_id[:6]}")
         
         return {
             "dossierId": dossier_id,
@@ -539,8 +498,8 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
         }
 
     # RULE 6: Default / No Action
-    first_line_id = lines_info[0]["lineId"]
-    ref_id = extract_exact_ref(f"REF-{dossier_id[:6]}")
+    first_line_id = all_lines[0][0] if all_lines else "L1"
+    ref_id = extract_ref(full_text, default=f"REF-{dossier_id[:6]}")
     
     reason = "INFORMATIONAL"
     if "duplicate" in full_text_lower:
@@ -561,21 +520,29 @@ def generate_proposal_for_dossier(dossier: dict) -> dict:
 
 
 # ==========================================
-# UNIFIED REQUEST HANDLER (Supports Q1 & Q2 Concurrently)
+# UNIFIED MULTI-QUESTION ROUTER (Q1, Q2 & Q3)
 # ==========================================
 
 class RequestHandler(BaseHTTPRequestHandler):
-    def reply(self, status_code: int, data: dict):
+    def reply(self, status_code: int, data: dict, media_type: str = 'application/json; charset=utf-8'):
         body = json.dumps(data, ensure_ascii=False).encode('utf-8')
         self.send_response(status_code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Type', media_type)
         self.send_header('Cache-Control', 'no-store')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        self.reply(200, {'ok': True, 'service': 'multi-task-guardrail-and-action-gate'})
+        # ROUTER STEP A: Question 3 A2A Protocol Routes (Agent Card, Tasks List, Task View)
+        if self.path == '/.well-known/agent-card.json' or self.path.startswith('/a2a'):
+            base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
+            headers_dict = {k: v for k, v in self.headers.items()}
+            code, resp_data = q3_invoice_agent.handle_a2a_route(self.path, 'GET', headers_dict, b'', base_url)
+            media_type = 'application/a2a+json' if code == 200 else 'application/json; charset=utf-8'
+            return self.reply(code, resp_data, media_type)
+            
+        self.reply(200, {'ok': True, 'service': 'unified-q1-q2-q3-server'})
 
     def do_POST(self):
         try:
@@ -584,12 +551,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return self.reply(400, {'action': 'block', 'reason': 'invalid content length', 'result': None})
 
             raw_body = self.rfile.read(content_length)
+
+            # ROUTER STEP A: Question 3 A2A Protocol POST Routes (/a2a/message:send, /a2a/tasks/{id}:cancel)
+            if self.path.startswith('/a2a'):
+                base_url = "https://" + self.headers.get('Host', 'tds-week5-r5v9.onrender.com') + "/a2a/"
+                headers_dict = {k: v for k, v in self.headers.items()}
+                code, resp_data = q3_invoice_agent.handle_a2a_route(self.path, 'POST', headers_dict, raw_body, base_url)
+                media_type = 'application/a2a+json' if code == 200 else 'application/json; charset=utf-8'
+                return self.reply(code, resp_data, media_type)
+
             try:
                 req = json.loads(raw_body.decode('utf-8'))
             except Exception:
                 return self.reply(400, {'action': 'block', 'reason': 'malformed JSON payload', 'result': None})
 
-            # ROUTER STEP 1: Question 1 Agent Guardrail (tool: read_file / fetch_url)
+            # ROUTER STEP B: Question 1 Agent Guardrail (tool: read_file / fetch_url)
             if isinstance(req, dict) and 'tool' in req:
                 tool = req.get('tool')
                 args = req.get('arguments')
@@ -605,7 +581,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else:
                     return self.reply(200, {'action': 'block', 'reason': 'unknown tool', 'result': None})
 
-            # ROUTER STEP 2: Question 2 Mailroom Action Gate v2 (profile: ga5-mailroom-action-gate/v2)
+            # ROUTER STEP C: Question 2 Mailroom Action Gate v2 (profile: ga5-mailroom-action-gate/v2)
             elif isinstance(req, dict) and req.get('profile') == 'ga5-mailroom-action-gate/v2':
                 operation = req.get('operation')
                 if operation == 'propose':
@@ -826,7 +802,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     init_environment()
     init_db()
+    q3_invoice_agent.init_q3_db()
     port = int(os.environ.get('PORT', '10000'))
     server = ThreadingHTTPServer(('0.0.0.0', port), RequestHandler)
-    print(f"Unified Guardrail & Mailroom Gate server listening on port {port}...")
+    print(f"Unified Multi-Question Server listening on port {port}...")
     server.serve_forever()
